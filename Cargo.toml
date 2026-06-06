@@ -1,0 +1,112 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "txn-db"
+version = "0.2.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "MVCC transaction engine for Rust storage layers. Snapshot isolation and serializable transactions with multi-version concurrency control, conflict detection, and a durable transaction log on wal-db. The transaction layer for embedded databases and Hive DB."
+
+# Keywords (5 max)
+keywords = [
+    "mvcc",
+    "transactions",
+    "snapshot-isolation",
+    "database",
+    "concurrency"
+]
+
+# Categories
+categories = [
+    "database-implementations",
+    "concurrency",
+    "data-structures"
+]
+
+# Links
+homepage      = "https://github.com/jamesgober/txn-db"
+repository    = "https://github.com/jamesgober/txn-db"
+documentation = "https://docs.rs/txn-db"
+
+# Authors
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "txn_db"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+# Standard library.
+std = []
+# Durable transaction log via `wal-db`.
+durability = ["dep:wal-db"]
+# Serializable isolation (SSI) on top of snapshot isolation.
+serializable = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# Domain error type. Portfolio crates standardise on `error-forge` for stable
+# error metadata (kind/caption/is_fatal) instead of thiserror/anyhow in library
+# crates. Default features off — only the `ForgeError` trait is needed.
+error-forge = { version = "1.0", default-features = false }
+# Durable transaction commit log, behind the `durability` feature. Wired now so
+# the feature surface is stable; the recovery path lands in the 0.4 phase. The
+# in-repo sibling is pinned by path; the version mirrors the published crate.
+wal-db = { version = "1.0", path = "../wal-db", optional = true, default-features = false }
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+tempfile  = "3"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "txn_bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"

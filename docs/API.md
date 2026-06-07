@@ -18,9 +18,9 @@
 >
 > **Status: pre-1.0.** This document tracks the API surface as it lands across
 > the 0.x series. The Tier-1 surface documented here is settled as of `0.2` and
-> will not change shape before `1.0`; serializable isolation was added in `0.3`.
-> Sections marked _(planned)_ describe an intended surface that has not shipped
-> yet.
+> will not change shape before `1.0`; serializable isolation was added in `0.3`
+> and a durable commit log in `0.4`. Sections marked _(planned)_ describe an
+> intended surface that has not shipped yet.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -55,6 +55,7 @@ Run any of them with `cargo run --example <name>`.
   - [Atomic multi-key updates](#atomic-multi-key-updates)
   - [Consistent point-in-time reads](#consistent-point-in-time-reads)
   - [Preventing write skew (serializable)](#preventing-write-skew-serializable)
+  - [Durability and recovery](#durability-and-recovery)
   - [Implementing a custom store](#implementing-a-custom-store)
 - [Feature flags](#feature-flags)
 
@@ -64,7 +65,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.3"
+txn-db = "0.4"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.
@@ -139,6 +140,7 @@ written `Db` with no generics in the common case.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `new` | `fn new() -> Db<MemoryStore>` | An empty in-memory database. The default configuration. |
+| `open` | `fn open(path) -> Result<Db<MemoryStore>>` | A durable database backed by a write-ahead log at `path`, replaying committed transactions on startup. Requires the `durability` feature. |
 | `with_store` | `fn with_store(store: S) -> Db<S>` | A database over a custom [`VersionStore`](#versionstore). The Tier-3 seam. |
 | `default` | `fn default() -> Db<MemoryStore>` | Equivalent to `Db::new()`. |
 
@@ -393,6 +395,7 @@ assert_eq!(Timestamp::from_raw(42).to_string(), "@42");
 pub enum TxnError {
     Conflict { key_len: usize },
     Store { context: &'static str, detail: String },
+    Durability { detail: String },
 }
 ```
 
@@ -407,6 +410,7 @@ metadata is available to portfolio tooling). It is `#[non_exhaustive]`: a
 |---------|---------|------------|
 | `Conflict { key_len }` | A write-write conflict aborted the commit; another transaction committed a change to a written key after this one's snapshot. Only the key length is carried, never its bytes, so the error is safe to log. | Retry: begin a fresh transaction, re-read, re-apply, commit again. |
 | `Store { context, detail }` | The backing [`VersionStore`](#versionstore) failed a read or apply. The in-memory store never produces this. | Store-specific; inspect the variant. |
+| `Durability { detail }` | The durable commit log failed, or a record read during recovery did not decode. Produced only with the `durability` feature. An unacknowledged commit is never durable, but the durability guarantee is in doubt — `is_fatal` is `true`. | Treat as unrecoverable; do not retry blindly. |
 
 #### Methods
 
@@ -710,6 +714,40 @@ assert!(t2.commit().is_err());   // t2 read x, which t1 changed
 # Ok::<(), txn_db::TxnError>(())
 ```
 
+### Durability and recovery
+
+Open the database with [`Db::open`](#db) (the `durability` feature) to back it
+with a write-ahead log. Each commit is appended and synced before it is
+acknowledged, and the log is replayed on the next open.
+
+```rust
+# #[cfg(feature = "durability")]
+# {
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("txn.wal");
+use txn_db::Db;
+
+{
+    let db = Db::open(&path)?;
+    let mut tx = db.begin();
+    tx.put(b"k".to_vec(), b"v".to_vec());
+    tx.commit()?;          // appended + synced before this returns
+}
+
+// A new process reopens the same log.
+let db = Db::open(&path)?;
+assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&b"v"[..]));
+# }
+# Ok::<(), txn_db::TxnError>(())
+```
+
+Only committed transactions are ever logged, so recovery has nothing to undo: a
+transaction that aborted, or that the process never managed to make durable, is
+simply absent on reopen. A torn record at the tail of the log — a crash
+mid-append — is discarded when the log is opened, so recovery always yields a
+clean prefix of commits. Commit timestamps resume strictly after the highest
+recovered timestamp.
+
 ### Implementing a custom store
 
 Wrap or replace the backing store through [`VersionStore`](#versionstore). This
@@ -757,7 +795,7 @@ tx.commit()?;
 |---------|---------|-------------|
 | `std` | yes | Standard library. Required by the current implementation. |
 | `serializable` | no | Adds [`Db::begin_serializable`](#db): serializable isolation via read-set validation on top of snapshot isolation. Additive — snapshot isolation is unchanged when off. |
-| `durability` | no | Durable transaction log via `wal-db`. _(planned: 0.4)_ |
+| `durability` | no | Adds [`Db::open`](#db): a `wal-db` write-ahead commit log, synced before each commit is acknowledged and replayed on startup. Additive — the in-memory `Db::new` path is unchanged when off. |
 
 ---
 

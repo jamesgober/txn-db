@@ -266,6 +266,23 @@ impl MemoryStore {
     fn shard_of(&self, key: &[u8]) -> usize {
         (hash_key(key) as usize) & self.mask
     }
+
+    /// Install a recovered version directly, without conflict validation.
+    ///
+    /// Used only during durability recovery, replaying a committed transaction
+    /// from the log. The caller installs recovered commits in ascending
+    /// commit-timestamp order, so each version is appended to the end of its
+    /// chain and the ascending invariant is preserved.
+    #[cfg(feature = "durability")]
+    pub(crate) fn install_recovered(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) {
+        for (key, value) in writes {
+            let shard = self.shard_of(&key);
+            sync::write(&self.shards[shard].chains)
+                .entry(key)
+                .or_default()
+                .push(Version { commit_ts, value });
+        }
+    }
 }
 
 impl VersionStore for MemoryStore {

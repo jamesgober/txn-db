@@ -92,6 +92,8 @@
 #![forbid(unsafe_code)]
 
 mod db;
+#[cfg(feature = "durability")]
+mod durable;
 mod error;
 mod oracle;
 mod store;

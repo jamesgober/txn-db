@@ -58,6 +58,25 @@ impl Oracle {
         }
     }
 
+    /// Create an oracle for a database recovered from a durable log, where every
+    /// commit up to and including `highest` is already applied.
+    ///
+    /// The next commit hands out `highest + 1`, and the read watermark starts at
+    /// `highest` so a transaction beginning right after recovery sees all
+    /// recovered state.
+    #[cfg(feature = "durability")]
+    pub(crate) fn recovered(highest: Timestamp) -> Self {
+        let highest = highest.get();
+        Oracle {
+            next_ts: AtomicU64::new(highest + 1),
+            read_ts: AtomicU64::new(highest),
+            pending: Mutex::new(Pending {
+                done_upto: highest,
+                ahead: HashSet::new(),
+            }),
+        }
+    }
+
     /// The timestamp a transaction beginning now should read at: the current
     /// watermark. Lock-free.
     #[inline]

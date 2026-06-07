@@ -41,19 +41,20 @@
 
 <h2>What it does</h2>
 
-Available now (`0.3`):
+Available now (`0.4`):
 
 - **MVCC** &mdash; each write creates a new version; readers see a consistent snapshot without blocking writers
 - **Snapshot isolation** &mdash; a transaction reads the database as of its start timestamp; its own writes are visible to itself before commit
 - **Serializable (SSI)** &mdash; opt-in read-set validation under the `serializable` feature, rejecting write skew and the read-only anomaly
+- **Durable commit log** &mdash; under the `durability` feature, `Db::open` logs each commit to a `wal-db` write-ahead log and syncs before acknowledging; the log is replayed on restart
 - **Write-write conflict detection** &mdash; first-committer-wins at commit; the later writer is told to retry with a typed, retryable error
 - **Sharded commit path** &mdash; lock-free timestamp allocation and per-shard conflict checks, so commits to unrelated keys do not contend (loom-checked)
 - **Pluggable backing store** &mdash; the version store is the `VersionStore` trait; an in-memory store ships, and any backend plugs in
 
 On the roadmap:
 
-- **Durable txn log** &mdash; commits logged to `wal-db` before acknowledgment (under `durability`)
 - **Garbage collection** &mdash; old versions reclaimed once no live snapshot can observe them
+- **Backing-store integration** &mdash; compose over `lsm-db` or any store through the trait
 
 
 <br>
@@ -62,10 +63,10 @@ On the roadmap:
 
 ```toml
 [dependencies]
-txn-db = "0.3"
+txn-db = "0.4"
 
-# Opt into serializable isolation:
-txn-db = { version = "0.3", features = ["serializable"] }
+# Opt into serializable isolation and/or a durable commit log:
+txn-db = { version = "0.4", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -150,6 +151,38 @@ assert!(t2.commit().is_err());         // second read a row t1 changed — rejec
 See [`examples/serializable_doctors.rs`](./examples/serializable_doctors.rs) for the
 full on-call-doctors demonstration, side by side under both isolation levels.
 
+## Durability
+
+With the `durability` feature, `Db::open` backs the database with a `wal-db`
+write-ahead log. Each commit's record is appended and synced before `commit`
+returns, so an acknowledged commit survives a crash; on restart the log is
+replayed and uncommitted work leaves no trace.
+
+```rust
+# #[cfg(feature = "durability")]
+# {
+# let dir = tempfile::tempdir().unwrap();
+# let path = dir.path().join("txn.wal");
+use txn_db::Db;
+
+// First run: commit, then the process exits.
+{
+    let db = Db::open(&path)?;
+    let mut tx = db.begin();
+    tx.put(b"k".to_vec(), b"v".to_vec());
+    tx.commit()?;
+}
+
+// Restart: the log is replayed and the committed write is back.
+let db = Db::open(&path)?;
+assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&b"v"[..]));
+# }
+# Ok::<(), txn_db::TxnError>(())
+```
+
+See [`examples/durable_store.rs`](./examples/durable_store.rs) for a commit /
+drop / reopen walkthrough.
+
 <br>
 
 ## Examples
@@ -162,23 +195,25 @@ full on-call-doctors demonstration, side by side under both isolation levels.
 | [`snapshot_reads`](./examples/snapshot_reads.rs) | A snapshot stays stable as the database moves on. |
 | [`custom_store`](./examples/custom_store.rs) | Backing the engine with a custom `VersionStore`. |
 | [`serializable_doctors`](./examples/serializable_doctors.rs) | Write skew under SI vs serializable (needs `--features serializable`). |
+| [`durable_store`](./examples/durable_store.rs) | Commit, drop, reopen — recovery from the log (needs `--features durability`). |
 
 ```bash
 cargo run --example quick_start
 cargo run --example serializable_doctors --features serializable
+cargo run --example durable_store --features durability
 ```
 
 <br>
 
 ## Status
 
-This is the `0.3` release: the MVCC core and snapshot isolation from the
-foundation, now with serializable isolation (the `serializable` feature) and a
-sharded, lock-free commit path whose concurrency is verified with `loom`. The
+This is the `0.4` release: the MVCC core, snapshot and serializable isolation,
+and a sharded lock-free commit path, now with a durable commit log via `wal-db`
+(the `durability` feature) and log replay on restart. The
 [`docs/API.md`](./docs/API.md) reference documents the full Tier-1 surface, and
-the remaining phases — durable commits via `wal-db` and version garbage
-collection — follow per the roadmap. The shape of the Tier-1 API is settled and
-will not change before `1.0`.
+the remaining phases — version garbage collection and backing-store integration
+— follow per the roadmap. The shape of the Tier-1 API is settled and will not
+change before `1.0`.
 
 <hr>
 <br>

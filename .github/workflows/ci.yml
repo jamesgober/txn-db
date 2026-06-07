@@ -33,7 +33,11 @@ jobs:
       - name: Test
         run: cargo test --all-features
       - name: Doc
-        run: cargo doc --no-deps --all-features
+        # Build docs with both default and all features: a doc link to a
+        # feature-gated item breaks only when that feature is off.
+        run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 

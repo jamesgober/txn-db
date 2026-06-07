@@ -29,9 +29,9 @@ use crate::timestamp::Timestamp;
 /// A read-write transaction over a consistent snapshot of the database.
 ///
 /// A transaction is created by [`Db::begin`](crate::Db::begin) (snapshot
-/// isolation) or [`Db::begin_serializable`](crate::Db::begin_serializable)
-/// (serializable). It reads as of the snapshot timestamp captured at that
-/// moment, so concurrent commits by other transactions are invisible to it.
+/// isolation) or `Db::begin_serializable` (serializable, with the
+/// `serializable` feature). It reads as of the snapshot timestamp captured at
+/// that moment, so concurrent commits by other transactions are invisible to it.
 /// Writes are buffered in the transaction and become visible to others only when
 /// [`commit`](Transaction::commit) succeeds; within the transaction, a read of a
 /// key it has written returns that pending write (read-your-own-writes).

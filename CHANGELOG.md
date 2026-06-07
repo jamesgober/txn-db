@@ -18,6 +18,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.0] - 2026-06-07
+
+Durability release: a write-ahead commit log via `wal-db`, with log replay on
+startup. The in-memory `Db::new` path is unchanged; durability is entirely
+opt-in.
+
+### Added
+
+- `Db::open(path)` (behind the new `durability` feature) — a database backed by
+  a `wal-db` write-ahead log. Each commit's record is appended and synced before
+  `commit` returns, so an acknowledged commit survives a crash; on open, the log
+  is replayed and committed transactions are reinstated.
+- Commit-record format and decoder with full bounds checking: a corrupt or
+  truncated record can never drive an out-of-bounds read or an unbounded
+  allocation.
+- `TxnError::Durability` — surfaced when the log cannot be written, synced, or
+  decoded; reported as fatal.
+- Crash-recovery integration tests (`tests/durability.rs`): committed
+  transactions survive reopen, uncommitted and rolled-back work does not,
+  tombstones persist, timestamps continue after recovery, and a property test
+  recovers a clean prefix from a log truncated at an arbitrary point.
+- `examples/durable_store.rs` — commit, drop, reopen walkthrough.
+- The CI `Doc` job now builds docs with both default and all features, so a doc
+  link to a feature-gated item cannot regress unnoticed.
+
+### Changed
+
+- `Cargo.toml`: the `durability` feature now pulls `wal-db` (from crates.io,
+  `default-features = false`), matching how the rest of the portfolio wires
+  first-party dependencies.
+
+### Fixed
+
+- Documentation comments linked `Db::begin_serializable` (a `serializable`-gated
+  method) from always-compiled items, breaking `cargo doc` without that feature.
+  The references are now plain code spans, so docs build under every feature
+  combination.
+
+---
+
 ## [0.3.0] - 2026-06-07
 
 Concurrency-control release: serializable isolation, and a sharded, lock-free
@@ -123,7 +163,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/txn-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/txn-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/txn-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/txn-db/releases/tag/v0.1.0

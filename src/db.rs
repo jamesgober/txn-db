@@ -32,6 +32,10 @@ pub(crate) struct Inner<S: VersionStore> {
     pub(crate) store: S,
     /// Allocates timestamps and tracks the consistent-read watermark.
     oracle: Oracle,
+    /// The durable commit log, present only for a database opened with
+    /// [`Db::open`]. `None` for an in-memory database.
+    #[cfg(feature = "durability")]
+    log: Option<crate::durable::CommitLog>,
 }
 
 impl<S: VersionStore> Inner<S> {
@@ -39,6 +43,8 @@ impl<S: VersionStore> Inner<S> {
         Inner {
             store,
             oracle: Oracle::new(),
+            #[cfg(feature = "durability")]
+            log: None,
         }
     }
 
@@ -61,9 +67,44 @@ impl<S: VersionStore> Inner<S> {
         reads: &[Arc<[u8]>],
     ) -> Result<Timestamp> {
         let commit_ts = self.oracle.alloc_commit_ts();
+
+        // Encode the durable record before the write set is consumed by the
+        // store. No cost for an in-memory database (no log).
+        #[cfg(feature = "durability")]
+        let record = self
+            .log
+            .as_ref()
+            .map(|_| crate::durable::encode_for_log(commit_ts, &writes));
+
         let outcome = self.store.try_commit(read_ts, commit_ts, writes, reads);
+
+        // Make the commit durable before it is acknowledged. The validate-and-
+        // apply has already happened in memory but is not yet visible — the
+        // watermark only advances at `commit_done` below — so a crash before the
+        // sync completes leaves a transaction that was never acknowledged and is
+        // recovered as absent.
+        #[cfg(feature = "durability")]
+        if outcome.is_ok() {
+            if let (Some(log), Some(record)) = (self.log.as_ref(), record) {
+                if let Err(err) = log.append_committed(&record) {
+                    self.oracle.commit_done(commit_ts);
+                    return Err(err);
+                }
+            }
+        }
+
         self.oracle.commit_done(commit_ts);
         outcome.map(|()| commit_ts)
+    }
+
+    /// Build the shared inner state for a database recovered from a durable log.
+    #[cfg(feature = "durability")]
+    fn recovered(store: S, oracle: Oracle, log: crate::durable::CommitLog) -> Self {
+        Inner {
+            store,
+            oracle,
+            log: Some(log),
+        }
     }
 }
 
@@ -76,9 +117,9 @@ impl<S: VersionStore> Inner<S> {
 /// with [`snapshot`](Db::snapshot) for read-only point-in-time views.
 ///
 /// Transactions default to **snapshot isolation**. With the `serializable`
-/// feature enabled, [`begin_serializable`](Db::begin_serializable) starts a
-/// transaction whose read set is validated at commit, rejecting write skew and
-/// the other anomalies snapshot isolation permits.
+/// feature enabled, `begin_serializable` starts a transaction whose read set is
+/// validated at commit, rejecting write skew and the other anomalies snapshot
+/// isolation permits.
 ///
 /// A `Db` is a clonable handle over shared state, like an [`Arc`]. Cloning it
 /// is cheap and every clone refers to the same database, so the idiomatic way
@@ -147,6 +188,68 @@ impl Db<MemoryStore> {
     pub fn new() -> Self {
         Db::with_store(MemoryStore::new())
     }
+
+    /// Open a durable database backed by a write-ahead log at `path`, replaying
+    /// any committed transactions already in the log.
+    ///
+    /// Every transaction committed against the returned database appends its
+    /// record to the log and syncs it before [`commit`](crate::Transaction::commit)
+    /// returns, so an acknowledged commit survives a crash. On open, the log is
+    /// replayed: each committed transaction is reinstated, and a transaction that
+    /// never reached the log — because it aborted, or because the process crashed
+    /// before its record was made durable — is simply absent. The recovered data
+    /// lives in memory; the log is the durable record from which it is rebuilt.
+    ///
+    /// Available with the `durability` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Durability`](crate::TxnError::Durability) if the log
+    /// cannot be opened or a record read back from it does not decode.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "durability")]
+    /// # {
+    /// # let dir = tempfile::tempdir().expect("tempdir");
+    /// # let path = dir.path().join("txn.wal");
+    /// use txn_db::Db;
+    ///
+    /// // Commit, then drop the database.
+    /// {
+    ///     let db = Db::open(&path)?;
+    ///     let mut tx = db.begin();
+    ///     tx.put(b"k".to_vec(), b"v".to_vec());
+    ///     tx.commit()?;
+    /// }
+    ///
+    /// // Reopening replays the log: the committed write is still there.
+    /// let db = Db::open(&path)?;
+    /// assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&b"v"[..]));
+    /// # }
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    #[cfg(feature = "durability")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Db<MemoryStore>> {
+        let (log, mut recovered) = crate::durable::CommitLog::open(path)?;
+
+        // Replay in ascending commit-timestamp order; records may sit in the log
+        // out of that order because commits append after applying, concurrently.
+        recovered.sort_by_key(|commit| commit.commit_ts);
+
+        let store = MemoryStore::new();
+        let mut highest = Timestamp::ZERO;
+        for commit in recovered {
+            highest = highest.max(commit.commit_ts);
+            store.install_recovered(commit.commit_ts, commit.writes);
+        }
+
+        Ok(Db {
+            inner: Arc::new(Inner::recovered(store, Oracle::recovered(highest), log)),
+        })
+    }
 }
 
 impl Default for Db<MemoryStore> {
@@ -185,8 +288,8 @@ impl<S: VersionStore> Db<S> {
     /// The transaction takes its snapshot at this moment: it reads as of the
     /// most recent commit and is unaffected by commits that happen afterward.
     /// Its writes are checked for write-write conflicts at commit, but its reads
-    /// are not validated — use [`begin_serializable`](Db::begin_serializable)
-    /// when you need serializability.
+    /// are not validated — use `begin_serializable` (with the `serializable`
+    /// feature) when you need serializability.
     ///
     /// # Examples
     ///

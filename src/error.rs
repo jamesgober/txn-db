@@ -67,6 +67,21 @@ pub enum TxnError {
         /// The store's human-readable description of the failure.
         detail: String,
     },
+
+    /// The durable commit log failed, or a record read back from it was not
+    /// intact.
+    ///
+    /// Produced only with the `durability` feature: when appending or syncing a
+    /// commit record fails, or when recovery on [`Db::open`](crate::Db) reads a
+    /// record whose bytes do not decode. A commit that fails to become durable
+    /// is *not* acknowledged — the contract that an acknowledged commit survives
+    /// a crash holds — but the failure is fatal in the sense that the database's
+    /// durability guarantee is in question, so treat it as unrecoverable rather
+    /// than retrying blindly.
+    Durability {
+        /// A human-readable description of the durability failure.
+        detail: String,
+    },
 }
 
 impl TxnError {
@@ -86,6 +101,16 @@ impl TxnError {
     pub fn store(context: &'static str, detail: impl fmt::Display) -> Self {
         TxnError::Store {
             context,
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Build a [`TxnError::Durability`] from a description of the failure.
+    #[cfg(feature = "durability")]
+    #[inline]
+    #[must_use]
+    pub(crate) fn durability(detail: impl fmt::Display) -> Self {
+        TxnError::Durability {
             detail: detail.to_string(),
         }
     }
@@ -140,6 +165,9 @@ impl fmt::Display for TxnError {
             TxnError::Store { context, detail } => {
                 write!(f, "version store error while {context}: {detail}")
             }
+            TxnError::Durability { detail } => {
+                write!(f, "durable commit log error: {detail}")
+            }
         }
     }
 }
@@ -151,6 +179,7 @@ impl ForgeError for TxnError {
         match self {
             TxnError::Conflict { .. } => "Conflict",
             TxnError::Store { .. } => "Store",
+            TxnError::Durability { .. } => "Durability",
         }
     }
 
@@ -158,11 +187,12 @@ impl ForgeError for TxnError {
         "transaction error"
     }
 
-    /// No transaction error is fatal: a [`Conflict`](TxnError::Conflict) is the
-    /// retry signal, and a [`Store`](TxnError::Store) failure is the store's to
-    /// classify. The crate never panics in place of returning one of these.
+    /// A [`Conflict`](TxnError::Conflict) is the retry signal and a
+    /// [`Store`](TxnError::Store) failure is the store's to classify, so neither
+    /// is fatal. A [`Durability`](TxnError::Durability) failure puts the crash
+    /// guarantee in doubt and is reported as fatal.
     fn is_fatal(&self) -> bool {
-        false
+        matches!(self, TxnError::Durability { .. })
     }
 }
 

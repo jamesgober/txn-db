@@ -18,8 +18,9 @@
 >
 > **Status: pre-1.0.** This document tracks the API surface as it lands across
 > the 0.x series. The Tier-1 surface documented here is settled as of `0.2` and
-> will not change shape before `1.0`. Sections marked _(planned)_ describe an
-> intended surface that has not shipped yet.
+> will not change shape before `1.0`; serializable isolation was added in `0.3`.
+> Sections marked _(planned)_ describe an intended surface that has not shipped
+> yet.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -53,6 +54,7 @@ Run any of them with `cargo run --example <name>`.
   - [Retrying on conflict](#retrying-on-conflict)
   - [Atomic multi-key updates](#atomic-multi-key-updates)
   - [Consistent point-in-time reads](#consistent-point-in-time-reads)
+  - [Preventing write skew (serializable)](#preventing-write-skew-serializable)
   - [Implementing a custom store](#implementing-a-custom-store)
 - [Feature flags](#feature-flags)
 
@@ -62,7 +64,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.2"
+txn-db = "0.3"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.
@@ -144,14 +146,18 @@ written `Db` with no generics in the common case.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `begin` | `fn begin(&self) -> Transaction<S>` | Start a read-write transaction over the current snapshot. |
+| `begin` | `fn begin(&self) -> Transaction<S>` | Start a snapshot-isolation transaction over the current snapshot. |
+| `begin_serializable` | `fn begin_serializable(&self) -> Transaction<S>` | Start a serializable transaction (read set validated at commit). Requires the `serializable` feature. |
 | `snapshot` | `fn snapshot(&self) -> Snapshot<S>` | Take a read-only, point-in-time view. |
 | `last_committed` | `fn last_committed(&self) -> Timestamp` | The timestamp of the most recent commit; `Timestamp::ZERO` if none. |
 | `clone` | `fn clone(&self) -> Self` | A new handle to the same database. |
 
-`begin` and `snapshot` both capture the current commit high-water mark as their
-read timestamp. Commits made after that moment are invisible to the returned
-transaction or snapshot.
+`begin`, `begin_serializable`, and `snapshot` all capture the current commit
+high-water mark as their read timestamp. Commits made after that moment are
+invisible to the returned transaction or snapshot. The difference between the two
+`begin` variants is at commit: a serializable transaction additionally validates
+that nothing it *read* has changed, while a snapshot-isolation transaction
+validates only what it *wrote*. See [Isolation model](#isolation-model).
 
 **Examples**
 
@@ -445,26 +451,31 @@ signatures read `Result<T>`.
 ```rust
 pub trait VersionStore: Send + Sync {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Arc<[u8]>>>;
-    fn latest_commit_ts(&self, key: &[u8]) -> Result<Option<Timestamp>>;
-    fn apply(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) -> Result<()>;
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<()>;
 }
 ```
 
 The Tier-3 seam: the backend a [`Db`](#db) is built on. The transaction layer
-supplies all of the isolation logic; an implementation only has to keep
-timestamped versions of keys and answer the snapshot-read query. Implementations
-must be `Send + Sync`.
+supplies the snapshot timestamps and the read and write sets; the store stores
+versions and is the serialization point that validates and applies each commit
+atomically. Implementations must be `Send + Sync`.
 
 #### Contract
 
 | Method | Obligation |
 |--------|------------|
 | `get` | Return the newest version of `key` whose commit timestamp is `<= read_ts`. A tombstone at that position reads as `None`. |
-| `latest_commit_ts` | Return the timestamp of the most recent version of `key`, accounting for every applied write including tombstones. Used for conflict detection. |
-| `apply` | Install a batch of versions at one `commit_ts`. The database calls this with strictly increasing timestamps and never concurrently with itself, so versions arrive in commit order. |
+| `try_commit` | As one step, atomic against any other `try_commit` touching an overlapping key: **validate** that no key in `writes` or `reads` has a version newer than `read_ts`, and if all pass, **apply** each write as a new version stamped `commit_ts`. `reads` is empty for snapshot-isolation transactions and carries the read set for serializable ones. The database hands out `commit_ts` uniquely and in increasing order. |
 
-**Errors**: any method may return [`TxnError::Store`](#txnerror) to surface a
-backend failure through the engine's `Result`.
+**Errors**: `try_commit` returns [`TxnError::Conflict`](#txnerror) if validation
+fails (nothing is applied). Any method may return [`TxnError::Store`](#txnerror)
+to surface a backend failure through the engine's `Result`.
 
 **Example** — driving the shipped store directly through the trait:
 
@@ -474,7 +485,12 @@ use txn_db::{MemoryStore, Timestamp, VersionStore};
 
 let store = MemoryStore::new();
 let key: Arc<[u8]> = Arc::from(&b"k"[..]);
-store.apply(Timestamp::from_raw(1), vec![(key.clone(), Some(Arc::from(&b"v1"[..])))])?;
+store.try_commit(
+    Timestamp::ZERO,
+    Timestamp::from_raw(1),
+    vec![(key.clone(), Some(Arc::from(&b"v1"[..])))],
+    &[],
+)?;
 
 assert_eq!(store.get(b"k", Timestamp::from_raw(1))?.as_deref(), Some(&b"v1"[..]));
 assert_eq!(store.get(b"k", Timestamp::ZERO)?, None);
@@ -492,18 +508,21 @@ that adds behavior over an inner store.
 pub struct MemoryStore { /* … */ }
 ```
 
-An in-memory [`VersionStore`](#versionstore) backed by a hash map of version
-chains. Each key maps to its versions in ascending commit-timestamp order, so a
-snapshot read is a binary search for the newest version at or below the snapshot
-timestamp. This is the default store of [`Db::new`](#db) and is well suited to
-caches, tests, and workloads that fit in memory. Versions accumulate until
-garbage collection lands (a later roadmap phase).
+An in-memory [`VersionStore`](#versionstore) that shards the keyspace across
+independent, separately-locked maps of version chains. Each key hashes to one
+shard; within a shard its versions are kept in ascending commit-timestamp order,
+so a snapshot read is a binary search. Reads lock one shard and commits lock only
+the shards their keys fall in, so commits to unrelated keys run in parallel. This
+is the default store of [`Db::new`](#db) and is well suited to caches, tests, and
+workloads that fit in memory. Versions accumulate until garbage collection lands
+(a later roadmap phase).
 
 #### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `new` | `fn new() -> MemoryStore` | An empty store. |
+| `new` | `fn new() -> MemoryStore` | An empty store with the default shard count. |
+| `with_shards` | `fn with_shards(shards: usize) -> MemoryStore` | An empty store with a chosen shard count, rounded up to a power of two. Tune only with a benchmark in hand. |
 | `default` | `fn default() -> MemoryStore` | Equivalent to `new()`. |
 | `key_count` | `fn key_count(&self) -> usize` | Number of distinct keys ever written (includes keys whose latest version is a tombstone). |
 
@@ -557,21 +576,38 @@ let _ts: Timestamp = tx.commit()?;
 
 ## Isolation model
 
-`txn-db` provides **snapshot isolation**:
+`txn-db` provides **snapshot isolation** by default, with **serializable
+isolation** available per transaction under the `serializable` feature.
+
+Common to both:
 
 - A transaction reads the database as of the instant it began. Commits by other
   transactions afterward are invisible to it.
 - Within a transaction, reads reflect its own buffered writes
   (read-your-own-writes) before commit.
-- At commit, the engine applies **first-committer-wins**: if any key the
-  transaction wrote was changed by another transaction that committed after this
-  one's snapshot, the commit is rejected with a retryable
+- At commit, the engine applies **first-committer-wins** on the write set: if
+  any key the transaction wrote was changed by another transaction that committed
+  after this one's snapshot, the commit is rejected with a retryable
   [`TxnError::Conflict`](#txnerror) and none of its writes are applied. That rule
-  is what prevents lost updates.
+  prevents lost updates.
 
-Snapshot isolation permits write skew (two transactions reading an overlapping
-set and writing disjoint keys can both commit). Eliminating write skew requires
-serializable isolation (SSI), which is a planned feature.
+Snapshot isolation ([`Db::begin`](#db)) stops there. It permits **write skew**:
+two transactions that read an overlapping set and write *different* keys can both
+commit, because neither wrote what the other read.
+
+Serializable isolation ([`Db::begin_serializable`](#db)) additionally validates
+the **read set** at commit: if any key the transaction read changed after its
+snapshot, the commit is rejected. That closes write skew and the read-only
+anomaly, making the set of committing (writing) transactions serializable; a
+serializable transaction that writes nothing commits trivially, since it observed
+a consistent snapshot. This is optimistic read-set validation — it can reject a
+transaction that a more permissive scheme would allow, so retry-on-conflict
+applies to serializable transactions too. The serialization order is the commit
+order.
+
+Because the API exposes only point reads, there are no range predicates and so no
+range phantoms to consider; a read of an absent key is validated like any other,
+so a later insert of that key is caught.
 
 ---
 
@@ -643,10 +679,42 @@ assert!(a.is_some() && b.is_some());
 # Ok::<(), txn_db::TxnError>(())
 ```
 
+### Preventing write skew (serializable)
+
+When an invariant ties several rows together, snapshot isolation can let two
+transactions break it by each updating a different row. Use
+[`begin_serializable`](#db) (the `serializable` feature) so the read set is
+validated at commit.
+
+```rust
+# #[cfg(feature = "serializable")]
+# {
+use txn_db::Db;
+
+let db = Db::new();
+let mut seed = db.begin();
+seed.put(b"x".to_vec(), vec![1]);
+seed.put(b"y".to_vec(), vec![1]);
+seed.commit()?;
+
+let mut t1 = db.begin_serializable();
+let mut t2 = db.begin_serializable();
+let _ = (t1.get(b"x")?, t1.get(b"y")?);
+let _ = (t2.get(b"x")?, t2.get(b"y")?);
+t1.put(b"x".to_vec(), vec![0]);
+t2.put(b"y".to_vec(), vec![0]);
+
+t1.commit()?;
+assert!(t2.commit().is_err());   // t2 read x, which t1 changed
+# }
+# Ok::<(), txn_db::TxnError>(())
+```
+
 ### Implementing a custom store
 
 Wrap or replace the backing store through [`VersionStore`](#versionstore). This
-instrumented wrapper counts reads while delegating to an inner store:
+instrumented wrapper counts reads while delegating commit validation and apply to
+an inner store:
 
 ```rust
 use std::sync::Arc;
@@ -663,11 +731,14 @@ impl VersionStore for Counting {
         let _ = self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.get(key, read_ts)
     }
-    fn latest_commit_ts(&self, key: &[u8]) -> Result<Option<Timestamp>, TxnError> {
-        self.inner.latest_commit_ts(key)
-    }
-    fn apply(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) -> Result<(), TxnError> {
-        self.inner.apply(commit_ts, writes)
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<(), TxnError> {
+        self.inner.try_commit(read_ts, commit_ts, writes, reads)
     }
 }
 
@@ -685,8 +756,8 @@ tx.commit()?;
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | yes | Standard library. Required by the current implementation. |
+| `serializable` | no | Adds [`Db::begin_serializable`](#db): serializable isolation via read-set validation on top of snapshot isolation. Additive — snapshot isolation is unchanged when off. |
 | `durability` | no | Durable transaction log via `wal-db`. _(planned: 0.4)_ |
-| `serializable` | no | Serializable isolation (SSI) on top of snapshot isolation. _(planned: 0.3)_ |
 
 ---
 

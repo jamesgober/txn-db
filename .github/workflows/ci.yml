@@ -45,7 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Loom
-        run: cargo test --test loom_txn || echo "(loom test not yet present)"
+        run: cargo test --test loom_txn --release
         env:
           RUSTFLAGS: "--cfg loom"
 

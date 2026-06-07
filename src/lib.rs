@@ -93,7 +93,9 @@
 
 mod db;
 mod error;
+mod oracle;
 mod store;
+mod sync;
 mod timestamp;
 mod txn;
 

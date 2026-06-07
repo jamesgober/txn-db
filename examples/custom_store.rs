@@ -32,16 +32,24 @@ impl VersionStore for CountingStore {
         self.inner.get(key, read_ts)
     }
 
-    fn latest_commit_ts(&self, key: &[u8]) -> Result<Option<Timestamp>, TxnError> {
-        self.inner.latest_commit_ts(key)
-    }
-
-    fn apply(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) -> Result<(), TxnError> {
-        let _ = self
-            .counters
-            .versions_applied
-            .fetch_add(writes.len() as u64, Ordering::Relaxed);
-        self.inner.apply(commit_ts, writes)
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<(), TxnError> {
+        // Count the versions only when the commit actually lands; a conflict
+        // applies nothing.
+        let count = writes.len() as u64;
+        let outcome = self.inner.try_commit(read_ts, commit_ts, writes, reads);
+        if outcome.is_ok() {
+            let _ = self
+                .counters
+                .versions_applied
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        outcome
     }
 }
 

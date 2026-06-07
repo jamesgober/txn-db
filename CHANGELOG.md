@@ -18,6 +18,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.3.0] - 2026-06-07
+
+Concurrency-control release: serializable isolation, and a sharded, lock-free
+commit path that replaces the foundation's single global commit lock. Snapshot
+isolation remains the default and is unchanged.
+
+### Added
+
+- `Db::begin_serializable` (behind the new `serializable` feature) — a
+  transaction that tracks its read set and validates it at commit, rejecting
+  write skew and the read-only anomaly that snapshot isolation permits. A
+  serializable transaction that writes nothing commits trivially.
+- `MemoryStore::with_shards` — construct the in-memory store with a chosen shard
+  count (rounded up to a power of two) for tuning commit concurrency.
+- Timestamp oracle with a lock-free read watermark: `begin` and `snapshot` read
+  their timestamp without taking a lock, and commit timestamps are allocated with
+  a single atomic increment.
+- `loom` concurrency model checks (`tests/loom_txn.rs`) for the concurrent-commit
+  path: one-winner conflict detection on a contended key, and consistent
+  visibility of disjoint commits. The CI `loom` job now runs them as a gate.
+- Serializable property tests (`tests/serializable.rs`): write skew never lets
+  both commit, disjoint serializable transactions both commit, uncontended and
+  read-only serializable transactions always commit.
+- `examples/serializable_doctors.rs` — the on-call-doctors write-skew problem,
+  shown under both isolation levels.
+
+### Changed
+
+- **Breaking (Tier-3):** the `VersionStore` trait replaced `latest_commit_ts` and
+  `apply` with a single `try_commit(read_ts, commit_ts, writes, reads)` that
+  validates the read and write sets and applies the writes atomically. This makes
+  the store the serialization point and is what enables sharded, lock-free
+  commits. The Tier-1 surface (`Db`, `Transaction`, `Snapshot`) is unchanged.
+- `MemoryStore` now shards the keyspace across independently locked maps, so
+  commits to unrelated keys no longer contend on one lock. The single global
+  commit lock is gone.
+- CI: the `loom` job runs `cargo test --test loom_txn --release` as a required
+  check; `[lints.rust] unexpected_cfgs` allows the `loom` cfg under
+  `deny(warnings)`.
+
+---
+
 ## [0.2.0] - 2026-06-06
 
 Foundation release: the public API, the MVCC core, snapshot isolation, and
@@ -81,6 +123,7 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/txn-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/txn-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/txn-db/releases/tag/v0.1.0

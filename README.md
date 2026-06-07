@@ -41,16 +41,17 @@
 
 <h2>What it does</h2>
 
-Available now (`0.2`):
+Available now (`0.3`):
 
 - **MVCC** &mdash; each write creates a new version; readers see a consistent snapshot without blocking writers
 - **Snapshot isolation** &mdash; a transaction reads the database as of its start timestamp; its own writes are visible to itself before commit
+- **Serializable (SSI)** &mdash; opt-in read-set validation under the `serializable` feature, rejecting write skew and the read-only anomaly
 - **Write-write conflict detection** &mdash; first-committer-wins at commit; the later writer is told to retry with a typed, retryable error
+- **Sharded commit path** &mdash; lock-free timestamp allocation and per-shard conflict checks, so commits to unrelated keys do not contend (loom-checked)
 - **Pluggable backing store** &mdash; the version store is the `VersionStore` trait; an in-memory store ships, and any backend plugs in
 
 On the roadmap:
 
-- **Serializable (SSI)** &mdash; optional serializable isolation via read/write conflict tracking
 - **Durable txn log** &mdash; commits logged to `wal-db` before acknowledgment (under `durability`)
 - **Garbage collection** &mdash; old versions reclaimed once no live snapshot can observe them
 
@@ -61,7 +62,10 @@ On the roadmap:
 
 ```toml
 [dependencies]
-txn-db = "0.2"
+txn-db = "0.3"
+
+# Opt into serializable isolation:
+txn-db = { version = "0.3", features = ["serializable"] }
 ```
 
 <br>
@@ -110,6 +114,42 @@ for the contended read-modify-write pattern, [`examples/bank_transfer.rs`](./exa
 for an atomic multi-key transfer, and [`examples/custom_store.rs`](./examples/custom_store.rs)
 for plugging in your own `VersionStore`.
 
+## Serializable isolation
+
+Snapshot isolation still allows *write skew*: two transactions that read the same
+rows and write different ones can both commit, breaking an invariant that ties
+those rows together. With the `serializable` feature,
+[`begin_serializable`](https://docs.rs/txn-db) validates a transaction's read set
+at commit and rejects exactly those cases.
+
+```rust
+# #[cfg(feature = "serializable")]
+# {
+use txn_db::Db;
+
+let db = Db::new();
+let mut seed = db.begin();
+seed.put(b"on_call:alice".to_vec(), vec![1]);
+seed.put(b"on_call:bob".to_vec(), vec![1]);
+seed.commit()?;
+
+// Both read the pair, then each takes one row off — classic write skew.
+let mut t1 = db.begin_serializable();
+let mut t2 = db.begin_serializable();
+let _ = (t1.get(b"on_call:alice")?, t1.get(b"on_call:bob")?);
+let _ = (t2.get(b"on_call:alice")?, t2.get(b"on_call:bob")?);
+t1.put(b"on_call:alice".to_vec(), vec![0]);
+t2.put(b"on_call:bob".to_vec(), vec![0]);
+
+t1.commit()?;                          // first commits
+assert!(t2.commit().is_err());         // second read a row t1 changed — rejected
+# }
+# Ok::<(), txn_db::TxnError>(())
+```
+
+See [`examples/serializable_doctors.rs`](./examples/serializable_doctors.rs) for the
+full on-call-doctors demonstration, side by side under both isolation levels.
+
 <br>
 
 ## Examples
@@ -121,19 +161,22 @@ for plugging in your own `VersionStore`.
 | [`concurrent_counter`](./examples/concurrent_counter.rs) | Many threads increment one key; no update is lost. |
 | [`snapshot_reads`](./examples/snapshot_reads.rs) | A snapshot stays stable as the database moves on. |
 | [`custom_store`](./examples/custom_store.rs) | Backing the engine with a custom `VersionStore`. |
+| [`serializable_doctors`](./examples/serializable_doctors.rs) | Write skew under SI vs serializable (needs `--features serializable`). |
 
 ```bash
 cargo run --example quick_start
+cargo run --example serializable_doctors --features serializable
 ```
 
 <br>
 
 ## Status
 
-This is the `0.2` foundation: the public surface, the MVCC core, snapshot
-isolation, and write-write conflict detection over an in-memory store. The
+This is the `0.3` release: the MVCC core and snapshot isolation from the
+foundation, now with serializable isolation (the `serializable` feature) and a
+sharded, lock-free commit path whose concurrency is verified with `loom`. The
 [`docs/API.md`](./docs/API.md) reference documents the full Tier-1 surface, and
-the remaining phases — serializable isolation, durable commits, and garbage
+the remaining phases — durable commits via `wal-db` and version garbage
 collection — follow per the roadmap. The shape of the Tier-1 API is settled and
 will not change before `1.0`.
 

@@ -12,41 +12,57 @@
 //!
 //! ## The contract a store must uphold
 //!
-//! A correct [`VersionStore`] keeps, for each key, the full history of versions
-//! it has been asked to apply, each tagged with the commit timestamp it was
-//! applied at. Its three obligations are:
+//! A correct [`VersionStore`] keeps, for each key, the history of versions it
+//! has been asked to apply, each tagged with the commit timestamp it was applied
+//! at. Its two obligations are:
 //!
 //! - [`get`](VersionStore::get) returns the *newest* version whose commit
 //!   timestamp is less than or equal to the caller's snapshot timestamp — the
 //!   snapshot-read rule. A tombstone (a delete) at that position reads as
 //!   "absent".
-//! - [`latest_commit_ts`](VersionStore::latest_commit_ts) returns the timestamp
-//!   of the most recent version of a key. The commit path uses it to detect
-//!   write-write conflicts, so it must reflect every applied write.
-//! - [`apply`](VersionStore::apply) installs a batch of versions at one commit
-//!   timestamp. The database calls it with strictly increasing timestamps and
-//!   never concurrently with itself, so an implementation may assume applied
-//!   versions arrive in commit order.
+//! - [`try_commit`](VersionStore::try_commit) validates a transaction's read and
+//!   write sets against its snapshot and, if nothing conflicts, installs its
+//!   writes at the commit timestamp — atomically with respect to other commits
+//!   touching the same keys. This single method is what makes the store the
+//!   serialization point for concurrent commits.
+//!
+//! ## Sharding
+//!
+//! [`MemoryStore`] partitions keys across independent shards, each with its own
+//! lock. Reads and commits that touch disjoint shards proceed without
+//! contending; a commit locks only the shards its keys fall in, in a fixed order
+//! so concurrent commits cannot deadlock. This is the sharded commit path the
+//! single global commit lock of the foundation release grew into.
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Result, TxnError};
+use crate::sync::{self, RwLock, RwLockWriteGuard};
 use crate::timestamp::Timestamp;
 
-/// One entry in a commit batch handed to [`VersionStore::apply`].
+/// One entry in a commit batch handed to [`VersionStore::try_commit`].
 ///
 /// A key paired with the value to write at the commit timestamp (`Some`) or a
 /// tombstone marking a delete (`None`).
 pub type WriteEntry = (Arc<[u8]>, Option<Arc<[u8]>>);
 
+/// Default number of shards. A power of two so the shard index is a mask, not a
+/// division. Sixteen spreads contention well for in-process workloads without
+/// the per-commit cost of locking a long list of shards. Loom builds use far
+/// fewer to keep the interleaving search tractable.
+#[cfg(not(loom))]
+const DEFAULT_SHARDS: usize = 16;
+#[cfg(loom)]
+const DEFAULT_SHARDS: usize = 2;
+
 /// A keeper of timestamped versions, the backend a [`Db`](crate::Db) is built on.
 ///
 /// This is the extension point for plugging `txn-db` onto a real storage
-/// engine. The transaction layer calls these three methods and supplies all of
-/// the isolation logic itself; an implementation only has to store versions and
-/// answer the snapshot-read query honestly. The three methods below state the
-/// precise contract.
+/// engine. The transaction layer supplies the snapshot timestamps and the read
+/// and write sets; the store stores versions and enforces, atomically, that a
+/// commit only lands when nothing it depends on has changed. The two methods
+/// below state the precise contract.
 ///
 /// Implementations must be `Send + Sync`: a [`Db`](crate::Db) shares one store
 /// across every thread that holds a clone of it.
@@ -62,8 +78,13 @@ pub type WriteEntry = (Arc<[u8]>, Option<Arc<[u8]>>);
 /// let store = MemoryStore::new();
 /// let key: Arc<[u8]> = Arc::from(&b"k"[..]);
 ///
-/// // Apply one version at commit timestamp 1.
-/// store.apply(Timestamp::from_raw(1), vec![(key.clone(), Some(Arc::from(&b"v1"[..])))])?;
+/// // Commit one version at timestamp 1 (snapshot 0, no reads to validate).
+/// store.try_commit(
+///     Timestamp::ZERO,
+///     Timestamp::from_raw(1),
+///     vec![(key.clone(), Some(Arc::from(&b"v1"[..])))],
+///     &[],
+/// )?;
 ///
 /// // A reader at timestamp 1 sees it; a reader at timestamp 0 does not.
 /// assert_eq!(store.get(b"k", Timestamp::from_raw(1))?.as_deref(), Some(&b"v1"[..]));
@@ -84,32 +105,37 @@ pub trait VersionStore: Send + Sync {
     /// to service the read. [`MemoryStore`] never fails.
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Arc<[u8]>>>;
 
-    /// Return the commit timestamp of the most recent version of `key`.
+    /// Validate a transaction and, if it does not conflict, apply its writes.
     ///
-    /// Returns `None` if the key has never been written. The commit path uses
-    /// this to decide whether a key was modified after a transaction's
-    /// snapshot, so it must account for every version ever applied — including
-    /// tombstones.
+    /// The store must perform the following as one step, atomic with respect to
+    /// any other `try_commit` that touches an overlapping key:
     ///
-    /// # Errors
+    /// 1. **Validate.** For every key in `writes` and every key in `reads`,
+    ///    check that the key has no version with a commit timestamp greater than
+    ///    `read_ts` — that is, that nothing the transaction wrote or read has
+    ///    changed since its snapshot. `reads` is empty for snapshot-isolation
+    ///    transactions and carries the read set for serializable ones.
+    /// 2. **Apply.** If validation passes, install each write in `writes` as a
+    ///    new version stamped `commit_ts` (`Some` is a value, `None` a
+    ///    tombstone). The database guarantees `commit_ts` is unique and that
+    ///    timestamps are handed out in increasing order.
     ///
-    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backend fails.
-    /// [`MemoryStore`] never fails.
-    fn latest_commit_ts(&self, key: &[u8]) -> Result<Option<Timestamp>>;
-
-    /// Install a batch of versions at `commit_ts`.
-    ///
-    /// Each entry is a key paired with either `Some(value)` (a write) or `None`
-    /// (a tombstone marking a delete). The database guarantees that `apply` is
-    /// called with strictly increasing `commit_ts` and is never run
-    /// concurrently with another `apply` on the same store, so versions arrive
-    /// in commit order.
+    /// If any key fails validation, the store applies nothing and reports the
+    /// conflict.
     ///
     /// # Errors
     ///
-    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backend fails
-    /// to persist the batch. [`MemoryStore`] never fails.
-    fn apply(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) -> Result<()>;
+    /// Returns [`TxnError::Conflict`](crate::TxnError::Conflict) if validation
+    /// fails; no writes are applied. Returns
+    /// [`TxnError::Store`](crate::TxnError::Store) if the backend fails to apply
+    /// the batch.
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<()>;
 }
 
 /// One stored version of a key: the timestamp it became visible and its value.
@@ -121,17 +147,28 @@ struct Version {
     value: Option<Arc<[u8]>>,
 }
 
-/// An in-memory [`VersionStore`] backed by a hash map of version chains.
+/// One shard's map from key to its version chain, kept in ascending
+/// commit-timestamp order.
+type Chains = HashMap<Arc<[u8]>, Vec<Version>>;
+
+/// One shard's slice of the keyspace.
+struct Shard {
+    chains: RwLock<Chains>,
+}
+
+/// An in-memory [`VersionStore`] that shards the keyspace for concurrency.
 ///
-/// Each key maps to its versions in ascending commit-timestamp order, so a
-/// snapshot read is a binary search for the newest version at or below the
-/// snapshot timestamp. This is the default store of [`Db::new`](crate::Db::new)
-/// and is well suited to caches, tests, and workloads that fit in memory.
+/// Each key is hashed to one of a fixed number of shards; each shard holds its
+/// keys' version chains behind its own reader-writer lock. Reads lock a single
+/// shard; a commit locks only the shards its keys fall in. Commits to disjoint
+/// shards therefore run in parallel, and the snapshot read of a key is a binary
+/// search within its shard for the newest version at or below the snapshot
+/// timestamp.
 ///
-/// `MemoryStore` is thread-safe and is meant to be shared: a [`Db`](crate::Db)
-/// holds it behind an [`Arc`] and clones that handle to every thread. Versions
-/// accumulate until garbage collection lands (a later roadmap phase), so a
-/// long-lived store under heavy overwrite grows without bound for now.
+/// This is the default store of [`Db::new`](crate::Db::new) and suits caches,
+/// tests, and workloads that fit in memory. Versions accumulate until garbage
+/// collection lands (a later roadmap phase), so a long-lived store under heavy
+/// overwrite grows without bound for now.
 ///
 /// # Examples
 ///
@@ -145,13 +182,20 @@ struct Version {
 /// tx.commit()?;
 /// # Ok::<(), txn_db::TxnError>(())
 /// ```
-#[derive(Debug, Default)]
 pub struct MemoryStore {
-    chains: RwLock<HashMap<Arc<[u8]>, Vec<Version>>>,
+    shards: Box<[Shard]>,
+    /// `shard_count - 1`; ANDed with a key hash to pick a shard.
+    mask: usize,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        MemoryStore::new()
+    }
 }
 
 impl MemoryStore {
-    /// Create an empty in-memory store.
+    /// Create an empty in-memory store with the default shard count.
     ///
     /// # Examples
     ///
@@ -161,11 +205,38 @@ impl MemoryStore {
     /// let store = MemoryStore::new();
     /// # let _ = store;
     /// ```
-    #[inline]
     #[must_use]
     pub fn new() -> Self {
+        MemoryStore::with_shards(DEFAULT_SHARDS)
+    }
+
+    /// Create an empty store with a specific number of shards.
+    ///
+    /// `shards` is rounded up to a power of two (and at least one). More shards
+    /// reduce contention between commits that touch unrelated keys, at the cost
+    /// of a larger fixed footprint. The default of [`MemoryStore::new`] suits
+    /// most workloads; tune this only with a benchmark in hand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::MemoryStore;
+    ///
+    /// let store = MemoryStore::with_shards(64);
+    /// # let _ = store;
+    /// ```
+    #[must_use]
+    pub fn with_shards(shards: usize) -> Self {
+        let count = shards.max(1).next_power_of_two();
+        let shards = (0..count)
+            .map(|_| Shard {
+                chains: RwLock::new(HashMap::new()),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         MemoryStore {
-            chains: RwLock::new(HashMap::new()),
+            shards,
+            mask: count - 1,
         }
     }
 
@@ -177,67 +248,121 @@ impl MemoryStore {
     /// # Examples
     ///
     /// ```
-    /// use txn_db::{Db, MemoryStore};
+    /// use txn_db::MemoryStore;
     ///
     /// let store = MemoryStore::new();
     /// assert_eq!(store.key_count(), 0);
     /// ```
     #[must_use]
     pub fn key_count(&self) -> usize {
-        read_guard(&self.chains).len()
+        self.shards
+            .iter()
+            .map(|shard| sync::read(&shard.chains).len())
+            .sum()
+    }
+
+    /// The shard a key belongs to.
+    #[inline]
+    fn shard_of(&self, key: &[u8]) -> usize {
+        (hash_key(key) as usize) & self.mask
     }
 }
 
 impl VersionStore for MemoryStore {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Arc<[u8]>>> {
-        let chains = read_guard(&self.chains);
-        let Some(versions) = chains.get(key) else {
-            return Ok(None);
-        };
-        // Versions are kept sorted ascending by commit timestamp, so the newest
-        // version visible at `read_ts` is the last one that is <= read_ts.
-        let visible = versions.partition_point(|v| v.commit_ts <= read_ts);
-        match visible.checked_sub(1).map(|i| &versions[i]) {
-            Some(version) => Ok(version.value.clone()),
-            None => Ok(None),
+        let shard = &self.shards[self.shard_of(key)];
+        let chains = sync::read(&shard.chains);
+        Ok(visible_value(chains.get(key), read_ts))
+    }
+
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<()> {
+        // Shard of every touched key, computed once.
+        let write_shards: Vec<usize> = writes.iter().map(|(k, _)| self.shard_of(k)).collect();
+        let read_shards: Vec<usize> = reads.iter().map(|k| self.shard_of(k)).collect();
+
+        // The distinct shards to lock, in ascending order so concurrent commits
+        // acquire shared shards in the same sequence and cannot deadlock.
+        let mut to_lock: Vec<usize> = write_shards
+            .iter()
+            .copied()
+            .chain(read_shards.iter().copied())
+            .collect();
+        to_lock.sort_unstable();
+        to_lock.dedup();
+
+        let mut guards: Vec<RwLockWriteGuard<'_, Chains>> = Vec::with_capacity(to_lock.len());
+        for &shard in &to_lock {
+            guards.push(sync::write(&self.shards[shard].chains));
         }
-    }
 
-    fn latest_commit_ts(&self, key: &[u8]) -> Result<Option<Timestamp>> {
-        let chains = read_guard(&self.chains);
-        Ok(chains.get(key).and_then(|v| v.last()).map(|v| v.commit_ts))
-    }
+        // Validate the write set, then the read set: abort if any touched key
+        // gained a version after the transaction's snapshot.
+        for (entry, &shard) in writes.iter().zip(&write_shards) {
+            if let Ok(pos) = to_lock.binary_search(&shard) {
+                if newer_than(guards[pos].get(entry.0.as_ref()), read_ts) {
+                    return Err(TxnError::conflict(entry.0.len()));
+                }
+            }
+        }
+        for (key, &shard) in reads.iter().zip(&read_shards) {
+            if let Ok(pos) = to_lock.binary_search(&shard) {
+                if newer_than(guards[pos].get(key.as_ref()), read_ts) {
+                    return Err(TxnError::conflict(key.len()));
+                }
+            }
+        }
 
-    fn apply(&self, commit_ts: Timestamp, writes: Vec<WriteEntry>) -> Result<()> {
-        let mut chains = write_guard(&self.chains);
-        for (key, value) in writes {
-            chains
-                .entry(key)
-                .or_default()
-                .push(Version { commit_ts, value });
+        // Apply: append a new version for each write under the held locks.
+        for ((key, value), &shard) in writes.into_iter().zip(&write_shards) {
+            if let Ok(pos) = to_lock.binary_search(&shard) {
+                guards[pos]
+                    .entry(key)
+                    .or_default()
+                    .push(Version { commit_ts, value });
+            }
         }
         Ok(())
     }
 }
 
-/// Take a read guard, recovering the data if a previous holder panicked.
-///
-/// The store's critical sections never panic, so poisoning can only originate
-/// from a panic elsewhere while a guard was held. The protected map is still
-/// structurally valid in that case, so recovering the guard is the resilient
-/// choice and keeps the store usable rather than turning one panic into a
-/// permanent failure.
+/// Whether `key`'s newest version (if any) was committed after `read_ts` — the
+/// condition that makes a commit conflict.
 #[inline]
-fn read_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(PoisonError::into_inner)
+fn newer_than(versions: Option<&Vec<Version>>, read_ts: Timestamp) -> bool {
+    matches!(versions.and_then(|v| v.last()), Some(v) if v.commit_ts > read_ts)
 }
 
+/// The value of the newest version at or below `read_ts`, or `None` if there is
+/// none or it is a tombstone.
 #[inline]
-fn write_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(PoisonError::into_inner)
+fn visible_value(versions: Option<&Vec<Version>>, read_ts: Timestamp) -> Option<Arc<[u8]>> {
+    let versions = versions?;
+    // Versions are ascending by commit timestamp; the newest visible one is the
+    // last entry whose timestamp is `<= read_ts`.
+    let visible = versions.partition_point(|v| v.commit_ts <= read_ts);
+    let idx = visible.checked_sub(1)?;
+    versions[idx].value.clone()
 }
 
-#[cfg(test)]
+/// FNV-1a hash of a key, used only to pick a shard. A non-cryptographic spread
+/// is all the shard index needs.
+#[inline]
+fn hash_key(key: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for &byte in key {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -246,8 +371,15 @@ mod tests {
         Arc::from(b)
     }
 
-    fn v(b: &[u8]) -> Option<Arc<[u8]>> {
-        Some(Arc::from(b))
+    fn commit(store: &MemoryStore, ts: u64, writes: Vec<WriteEntry>) {
+        store
+            .try_commit(
+                Timestamp::from_raw(ts - 1),
+                Timestamp::from_raw(ts),
+                writes,
+                &[],
+            )
+            .expect("commit");
     }
 
     #[test]
@@ -259,12 +391,8 @@ mod tests {
     #[test]
     fn test_read_sees_only_versions_at_or_before_snapshot() {
         let store = MemoryStore::new();
-        store
-            .apply(Timestamp::from_raw(2), vec![(k(b"x"), v(b"a"))])
-            .unwrap();
-        store
-            .apply(Timestamp::from_raw(4), vec![(k(b"x"), v(b"b"))])
-            .unwrap();
+        commit(&store, 2, vec![(k(b"x"), Some(k(b"a")))]);
+        commit(&store, 4, vec![(k(b"x"), Some(k(b"b")))]);
 
         assert_eq!(store.get(b"x", Timestamp::from_raw(1)).unwrap(), None);
         assert_eq!(
@@ -288,12 +416,8 @@ mod tests {
     #[test]
     fn test_tombstone_reads_as_absent() {
         let store = MemoryStore::new();
-        store
-            .apply(Timestamp::from_raw(1), vec![(k(b"x"), v(b"a"))])
-            .unwrap();
-        store
-            .apply(Timestamp::from_raw(2), vec![(k(b"x"), None)])
-            .unwrap();
+        commit(&store, 1, vec![(k(b"x"), Some(k(b"a")))]);
+        commit(&store, 2, vec![(k(b"x"), None)]);
 
         assert_eq!(
             store.get(b"x", Timestamp::from_raw(1)).unwrap().as_deref(),
@@ -303,33 +427,62 @@ mod tests {
     }
 
     #[test]
-    fn test_latest_commit_ts_tracks_newest_write() {
+    fn test_write_write_conflict_is_detected() {
         let store = MemoryStore::new();
-        assert_eq!(store.latest_commit_ts(b"x").unwrap(), None);
-        store
-            .apply(Timestamp::from_raw(3), vec![(k(b"x"), v(b"a"))])
-            .unwrap();
-        store
-            .apply(Timestamp::from_raw(7), vec![(k(b"x"), None)])
-            .unwrap();
+        commit(&store, 5, vec![(k(b"x"), Some(k(b"a")))]);
+
+        // A transaction whose snapshot predates the existing version conflicts.
+        let err = store
+            .try_commit(
+                Timestamp::from_raw(4),
+                Timestamp::from_raw(6),
+                vec![(k(b"x"), Some(k(b"b")))],
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, TxnError::Conflict { .. }));
+        // Nothing was applied.
         assert_eq!(
-            store.latest_commit_ts(b"x").unwrap(),
-            Some(Timestamp::from_raw(7))
+            store.get(b"x", Timestamp::from_raw(99)).unwrap().as_deref(),
+            Some(&b"a"[..])
         );
     }
 
     #[test]
-    fn test_key_count_counts_distinct_keys() {
+    fn test_read_set_validation_detects_skew() {
         let store = MemoryStore::new();
-        store
-            .apply(
-                Timestamp::from_raw(1),
-                vec![(k(b"a"), v(b"1")), (k(b"b"), v(b"2"))],
+        commit(&store, 5, vec![(k(b"y"), Some(k(b"1")))]);
+
+        // Snapshot 4, write x, but read y which changed at ts 5 -> conflict.
+        let err = store
+            .try_commit(
+                Timestamp::from_raw(4),
+                Timestamp::from_raw(6),
+                vec![(k(b"x"), Some(k(b"a")))],
+                &[k(b"y")],
             )
-            .unwrap();
-        store
-            .apply(Timestamp::from_raw(2), vec![(k(b"a"), v(b"3"))])
-            .unwrap();
-        assert_eq!(store.key_count(), 2);
+            .unwrap_err();
+        assert!(matches!(err, TxnError::Conflict { .. }));
+    }
+
+    #[test]
+    fn test_multi_shard_commit_applies_all_keys() {
+        let store = MemoryStore::with_shards(8);
+        let writes: Vec<WriteEntry> = (0u8..32).map(|i| (k(&[i]), Some(k(&[i])))).collect();
+        commit(&store, 1, writes);
+        for i in 0u8..32 {
+            assert_eq!(
+                store.get(&[i], Timestamp::from_raw(1)).unwrap().as_deref(),
+                Some(&[i][..])
+            );
+        }
+        assert_eq!(store.key_count(), 32);
+    }
+
+    #[test]
+    fn test_with_shards_rounds_up_to_power_of_two() {
+        let store = MemoryStore::with_shards(5);
+        assert_eq!(store.shards.len(), 8);
+        assert_eq!(store.mask, 7);
     }
 }

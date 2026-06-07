@@ -8,11 +8,17 @@
 //! [`rollback`](Transaction::rollback) or drop. Because reads come from a fixed
 //! snapshot, a transaction never blocks writers and is never blocked by them.
 //!
+//! Transactions run under snapshot isolation by default. A serializable
+//! transaction (from [`Db::begin_serializable`](crate::Db::begin_serializable),
+//! behind the `serializable` feature) additionally records every key it reads so
+//! that the read set can be validated at commit; that is the only behavioral
+//! difference, and it is invisible to a snapshot-isolation transaction.
+//!
 //! A [`Snapshot`] is the read-only counterpart: a consistent, point-in-time
-//! view with no write buffer and nothing to commit. Use it when you only need
-//! to read several keys as of one instant.
+//! view with no write buffer and nothing to commit.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::db::Inner;
@@ -22,10 +28,11 @@ use crate::timestamp::Timestamp;
 
 /// A read-write transaction over a consistent snapshot of the database.
 ///
-/// A transaction is created by [`Db::begin`](crate::Db::begin). It reads as of
-/// the snapshot timestamp captured at that moment, so concurrent commits by
-/// other transactions are invisible to it — this is snapshot isolation. Writes
-/// are buffered in the transaction and become visible to others only when
+/// A transaction is created by [`Db::begin`](crate::Db::begin) (snapshot
+/// isolation) or [`Db::begin_serializable`](crate::Db::begin_serializable)
+/// (serializable). It reads as of the snapshot timestamp captured at that
+/// moment, so concurrent commits by other transactions are invisible to it.
+/// Writes are buffered in the transaction and become visible to others only when
 /// [`commit`](Transaction::commit) succeeds; within the transaction, a read of a
 /// key it has written returns that pending write (read-your-own-writes).
 ///
@@ -33,7 +40,8 @@ use crate::timestamp::Timestamp;
 /// if another transaction committed a change to any of those keys after this
 /// transaction's snapshot, the commit is rejected with a retryable
 /// [`TxnError::Conflict`](crate::TxnError::Conflict) and none of the writes are
-/// applied. This is what prevents lost updates.
+/// applied. A serializable transaction also validates its read set, rejecting
+/// commits whose reads are no longer current.
 ///
 /// Dropping a transaction without committing discards its buffered writes; it
 /// is equivalent to [`rollback`](Transaction::rollback).
@@ -61,15 +69,23 @@ pub struct Transaction<S: VersionStore = MemoryStore> {
     inner: Arc<Inner<S>>,
     read_ts: Timestamp,
     writes: HashMap<Arc<[u8]>, Option<Arc<[u8]>>>,
+    /// The set of keys read from the snapshot, tracked only for serializable
+    /// transactions. `None` under snapshot isolation, where reads are not
+    /// validated. Interior mutability lets [`get`](Self::get) record reads
+    /// through a shared reference.
+    reads: Option<RefCell<HashSet<Arc<[u8]>>>>,
 }
 
 impl<S: VersionStore> Transaction<S> {
-    /// Construct a transaction over `inner` reading at `read_ts`.
-    pub(crate) fn new(inner: Arc<Inner<S>>, read_ts: Timestamp) -> Self {
+    /// Construct a transaction over `inner` reading at `read_ts`. When
+    /// `serializable` is set the transaction records its read set for validation
+    /// at commit.
+    pub(crate) fn new(inner: Arc<Inner<S>>, read_ts: Timestamp, serializable: bool) -> Self {
         Transaction {
             inner,
             read_ts,
             writes: HashMap::new(),
+            reads: serializable.then(|| RefCell::new(HashSet::new())),
         }
     }
 
@@ -100,7 +116,8 @@ impl<S: VersionStore> Transaction<S> {
     /// (read-your-own-writes), including `None` if it has deleted the key.
     /// Otherwise the value is read from the transaction's snapshot: the newest
     /// version committed at or before the snapshot timestamp, or `None` if the
-    /// key does not exist as of the snapshot.
+    /// key does not exist as of the snapshot. For a serializable transaction the
+    /// key is recorded in the read set for validation at commit.
     ///
     /// # Errors
     ///
@@ -127,7 +144,13 @@ impl<S: VersionStore> Transaction<S> {
         if let Some(pending) = self.writes.get(key) {
             return Ok(pending.clone());
         }
-        self.inner.store.get(key, self.read_ts)
+        let value = self.inner.store.get(key, self.read_ts)?;
+        // A serializable transaction records the key — present or absent — so a
+        // later writer to it is caught at commit.
+        if let Some(reads) = &self.reads {
+            let _ = reads.borrow_mut().insert(Arc::from(key));
+        }
+        Ok(value)
     }
 
     /// Buffer a write of `value` to `key`, to be applied at commit.
@@ -188,15 +211,18 @@ impl<S: VersionStore> Transaction<S> {
     /// On success every buffered write becomes visible to transactions that
     /// begin afterward, and the commit timestamp is returned. A transaction
     /// that buffered no writes commits trivially and returns its snapshot
-    /// timestamp without allocating a new one.
+    /// timestamp without allocating a new one — including a serializable
+    /// read-only transaction, which has observed a consistent snapshot and needs
+    /// no validation.
     ///
     /// # Errors
     ///
     /// Returns [`TxnError::Conflict`](crate::TxnError::Conflict) — which is
     /// retryable — if any written key was changed by another transaction that
-    /// committed after this one's snapshot; in that case no writes are applied.
-    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
-    /// fails to apply the batch.
+    /// committed after this one's snapshot, or, for a serializable transaction,
+    /// if any key it read has since changed. In either case no writes are
+    /// applied. Returns [`TxnError::Store`](crate::TxnError::Store) if the
+    /// backing store fails to apply the batch.
     ///
     /// # Examples
     ///
@@ -214,7 +240,18 @@ impl<S: VersionStore> Transaction<S> {
         if self.writes.is_empty() {
             return Ok(self.read_ts);
         }
-        self.inner.commit_writes(self.read_ts, self.writes)
+        // The read set, minus keys also in the write set (those are covered by
+        // the write-write check). Empty for snapshot-isolation transactions.
+        let reads: Vec<Arc<[u8]>> = match self.reads {
+            Some(set) => set
+                .into_inner()
+                .into_iter()
+                .filter(|key| !self.writes.contains_key(key))
+                .collect(),
+            None => Vec::new(),
+        };
+        let batch = self.writes.into_iter().collect();
+        self.inner.commit_writes(self.read_ts, batch, &reads)
     }
 
     /// Discard the transaction and all of its buffered writes.

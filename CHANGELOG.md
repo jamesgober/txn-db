@@ -56,9 +56,10 @@ surface is settled and will not change shape before `1.0`.
 
 ### Changed
 
-- `Cargo.toml`: added the `error-forge` dependency; pinned the optional `wal-db`
-  dependency (behind the `durability` feature) to the in-repo `1.0` sibling by
-  path so the feature surface resolves.
+- `Cargo.toml`: added the `error-forge` dependency. The `durability` and
+  `serializable` feature flags are declared as reserved no-ops so the surface is
+  stable; their implementations (and the `wal-db` dependency behind
+  `durability`) land in the 0.4 and 0.3 phases respectively.
 - `README.md`: leads with the Tier-1 surface, a quick start, and an examples
   table; status updated to the 0.2 foundation.
 

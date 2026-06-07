@@ -65,9 +65,12 @@ path = "src/lib.rs"
 default = ["std"]
 # Standard library.
 std = []
-# Durable transaction log via `wal-db`.
-durability = ["dep:wal-db"]
-# Serializable isolation (SSI) on top of snapshot isolation.
+# Reserved: durable transaction log via `wal-db`. The recovery path is wired in
+# the 0.4 phase; the flag is declared now so the feature surface is stable, but
+# it has no effect until then.
+durability = []
+# Reserved: serializable isolation (SSI) on top of snapshot isolation. Lands in
+# the 0.3 phase.
 serializable = []
 
 
@@ -78,10 +81,11 @@ serializable = []
 # error metadata (kind/caption/is_fatal) instead of thiserror/anyhow in library
 # crates. Default features off — only the `ForgeError` trait is needed.
 error-forge = { version = "1.0", default-features = false }
-# Durable transaction commit log, behind the `durability` feature. Wired now so
-# the feature surface is stable; the recovery path lands in the 0.4 phase. The
-# in-repo sibling is pinned by path; the version mirrors the published crate.
-wal-db = { version = "1.0", path = "../wal-db", optional = true, default-features = false }
+
+# `wal-db` is intentionally not a dependency yet: durable commits land in the
+# 0.4 phase, and wiring the sibling crate before then would couple this crate's
+# build to a path that does not exist in a standalone checkout. It is added
+# under the `durability` feature when that phase begins.
 
 
 # DEV DEPENDENCIES

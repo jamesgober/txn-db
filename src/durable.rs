@@ -9,9 +9,11 @@
 //!
 //! ## Record format
 //!
-//! Each record is one committed transaction, encoded little-endian:
+//! Each record is one committed transaction, encoded little-endian, beginning
+//! with a one-byte format version so the layout can evolve without ambiguity:
 //!
 //! ```text
+//! version   : u8                        format version (currently 1)
 //! commit_ts : u64
 //! count     : u32                       number of writes
 //! count × {
@@ -22,11 +24,13 @@
 //! }
 //! ```
 //!
-//! `wal-db` already frames each record with its own length and CRC32C and
-//! discards a torn record at the tail on recovery, so this format carries no
-//! checksum of its own. The decoder still validates every length against the
-//! bytes actually present, so a corrupt record can never drive an out-of-bounds
-//! read or an unbounded allocation.
+//! This layout is **frozen for the 1.x series** — see
+//! `docs/COMMIT_LOG_FORMAT.md` for the normative specification. `wal-db` already
+//! frames each record with its own length and CRC32C and discards a torn record
+//! at the tail on recovery, so this format carries no checksum of its own. The
+//! decoder still validates the version and every length against the bytes
+//! actually present, so a corrupt record can never drive an out-of-bounds read
+//! or an unbounded allocation.
 
 use std::sync::Arc;
 
@@ -77,6 +81,11 @@ impl CommitLog {
     }
 }
 
+/// Commit-record format version. The 1.x series writes and accepts version 1;
+/// the decoder rejects any other so a future format can be introduced without
+/// being mistaken for this one. Frozen for 1.x.
+const RECORD_VERSION: u8 = 1;
+
 /// The smallest possible encoded write: a zero-length key and a tombstone tag
 /// (`key_len` u32 + `tag` u8). Used to bound the write count before allocating.
 const MIN_WRITE_BYTES: usize = 4 + 1;
@@ -88,7 +97,8 @@ pub(crate) fn encode_for_log(commit_ts: Timestamp, writes: &[WriteEntry]) -> Vec
         .iter()
         .map(|(key, value)| 4 + key.len() + 1 + value.as_ref().map_or(0, |v| 4 + v.len()))
         .sum();
-    let mut buf = Vec::with_capacity(8 + 4 + body);
+    let mut buf = Vec::with_capacity(1 + 8 + 4 + body);
+    buf.push(RECORD_VERSION);
     buf.extend_from_slice(&commit_ts.get().to_le_bytes());
     buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
     for (key, value) in writes {
@@ -106,9 +116,16 @@ pub(crate) fn encode_for_log(commit_ts: Timestamp, writes: &[WriteEntry]) -> Vec
     buf
 }
 
-/// Decode one record, validating every length against the bytes present.
+/// Decode one record, validating the version and every length against the bytes
+/// present.
 fn decode_commit(bytes: &[u8]) -> Result<RecoveredCommit> {
     let mut reader = Reader::new(bytes);
+    let version = reader.read_u8()?;
+    if version != RECORD_VERSION {
+        return Err(TxnError::durability(format!(
+            "unsupported commit record version {version}"
+        )));
+    }
     let commit_ts = Timestamp::from_raw(reader.read_u64()?);
     let count = reader.read_u32()? as usize;
 
@@ -278,8 +295,8 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_implausible_count() {
-        // commit_ts = 0, count = u32::MAX, no body.
-        let mut bytes = Vec::new();
+        // version = 1, commit_ts = 0, count = u32::MAX, no body.
+        let mut bytes = vec![RECORD_VERSION];
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_commit(&bytes).is_err());
@@ -294,12 +311,19 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_bad_value_tag() {
-        let mut bytes = Vec::new();
+        let mut bytes = vec![RECORD_VERSION];
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes()); // one write
         bytes.extend_from_slice(&1u32.to_le_bytes()); // key_len = 1
         bytes.push(b'k');
         bytes.push(9); // invalid tag
+        assert!(decode_commit(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_decode_rejects_unknown_version() {
+        let mut bytes = encode_for_log(Timestamp::from_raw(1), &[entry(b"k", Some(b"v"))]);
+        bytes[0] = 2; // bump the version byte to an unsupported value
         assert!(decode_commit(&bytes).is_err());
     }
 }

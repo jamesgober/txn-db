@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Snapshot isolation by default. Optional serializable (SSI). Durable commits via wal-db.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The Tier-1 API is settled as of <code>0.2</code> and will not change shape before <code>1.0</code>; the commit protocol and any on-disk format are frozen at <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: stable (1.0).</strong> The public API is frozen until <code>2.0</code>, and the durable commit-log format is frozen for the <code>1.x</code> series (see <a href="./docs/COMMIT_LOG_FORMAT.md"><code>docs/COMMIT_LOG_FORMAT.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -59,10 +59,10 @@ Available now (`0.5`, feature-complete):
 
 ```toml
 [dependencies]
-txn-db = "0.9"
+txn-db = "1.0"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "0.9", features = ["serializable", "durability"] }
+txn-db = { version = "1.0", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -246,14 +246,15 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is the `0.9` release — the beta in the run to `1.0`. The engine is
-feature-complete, tuned, hardened, and API-frozen; `0.9` captures the final
-benchmarks, including an honest head-to-head against the naive
-`RwLock<HashMap>` alternative (txn-db wins single-thread reads and ~3× concurrent
-reads-under-writer; it costs more per write — the price of transactions, called
-out plainly in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)). See
-[`docs/API.md`](./docs/API.md) for the full surface. From here to `1.0` it is
-bug-fix and doc polish only — a soak, not new features.
+This is `1.0` — **stable**. The engine is feature-complete (snapshot and
+serializable isolation, sharded lock-free commits, a durable `wal-db` commit log,
+watermark garbage collection), tuned, hardened against adversarial schedules, and
+benchmarked honestly. The **public API is frozen until `2.0`** and the durable
+commit-log format is frozen for the `1.x` series
+([`docs/COMMIT_LOG_FORMAT.md`](./docs/COMMIT_LOG_FORMAT.md)). See
+[`docs/API.md`](./docs/API.md) for the full surface and
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) for hot-path and comparison
+numbers.
 
 <hr>
 <br>

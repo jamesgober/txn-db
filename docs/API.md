@@ -16,14 +16,12 @@
 
 > Complete reference for every public item in `txn-db`, with examples.
 >
-> **Status: pre-1.0.** This document tracks the API surface as it lands across
-> the 0.x series. The Tier-1 surface documented here is settled as of `0.2` and
-> **API frozen as of `0.7`.** Serializable isolation was added in `0.3`, a
-> durable commit log in `0.4`, and garbage collection in `0.5` — at which point
-> the engine became feature-complete; `0.6` tuned the hot path (see
-> [`PERFORMANCE.md`](./PERFORMANCE.md)) and `0.7` hardened it and froze the public
-> surface. `0.8` adds the autocommit `Db::get`/`put`/`delete` convenience (an
-> additive, MINOR-compatible change). No existing signature changes before `2.0`.
+> **Status: stable (1.0).** The surface documented here is **frozen until `2.0`**.
+> It arrived across the 0.x series — snapshot isolation (`0.2`), serializable
+> (`0.3`), durability (`0.4`), garbage collection (`0.5`), the optimization pass
+> (`0.6`), hardening + freeze (`0.7`), the autocommit convenience (`0.8`), and the
+> final benchmarks (`0.9`) — and is now stable. The durable commit-log format is
+> frozen for `1.x` ([`COMMIT_LOG_FORMAT.md`](./COMMIT_LOG_FORMAT.md)).
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -69,7 +67,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.9"
+txn-db = "1.0"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.

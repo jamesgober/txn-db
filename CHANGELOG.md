@@ -18,6 +18,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.0.0] - 2026-06-08
+
+First stable release. The public API is frozen until 2.0 and the durable
+commit-log format is frozen for the 1.x series. The engine is feature-complete,
+optimized, hardened, and benchmarked; the Definition of Done is satisfied.
+
+### Added
+
+- `docs/COMMIT_LOG_FORMAT.md` — the normative specification of the durable
+  commit-record format, frozen for 1.x.
+- A one-byte format version at the head of each commit record. The decoder
+  accepts only version 1 and rejects any other, so a future format cannot be
+  misread as this one.
+
+### Changed
+
+- **Public API frozen until 2.0** and the **durable commit-log format frozen for
+  1.x**. No breaking change will ship without a major version bump.
+
+### Notes
+
+- This is a stabilization release. No behavior changed except the additive
+  commit-record version byte (no published version carried persisted data, so
+  there is nothing to migrate). The full surface — `Db` (`new` / `open` /
+  `with_store` / `begin` / `begin_serializable` / `snapshot` / `get` / `put` /
+  `delete` / `last_committed` / `collect_garbage`), `Transaction`, `Snapshot`,
+  `Timestamp`, `TxnError`, `Result`, `VersionStore`, `MemoryStore`, `WriteEntry`,
+  `prelude` — is stable.
+
+---
+
 ## [0.9.0] - 2026-06-08
 
 Beta. Final benchmarks captured; no behavior or API change.
@@ -295,7 +326,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/txn-db/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/txn-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/txn-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/txn-db/compare/v0.6.0...v0.7.0

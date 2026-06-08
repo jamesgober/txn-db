@@ -18,8 +18,9 @@
 >
 > **Status: pre-1.0.** This document tracks the API surface as it lands across
 > the 0.x series. The Tier-1 surface documented here is settled as of `0.2` and
-> will not change shape before `1.0`; serializable isolation was added in `0.3`
-> and a durable commit log in `0.4`. Sections marked _(planned)_ describe an
+> will not change shape before `1.0`; serializable isolation was added in `0.3`,
+> a durable commit log in `0.4`, and garbage collection in `0.5` — at which point
+> the engine is feature-complete. Sections marked _(planned)_ describe an
 > intended surface that has not shipped yet.
 
 <h4 id="example-pointers">Example Pointers</h4>
@@ -56,6 +57,7 @@ Run any of them with `cargo run --example <name>`.
   - [Consistent point-in-time reads](#consistent-point-in-time-reads)
   - [Preventing write skew (serializable)](#preventing-write-skew-serializable)
   - [Durability and recovery](#durability-and-recovery)
+  - [Reclaiming old versions](#reclaiming-old-versions)
   - [Implementing a custom store](#implementing-a-custom-store)
 - [Feature flags](#feature-flags)
 
@@ -65,7 +67,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.4"
+txn-db = "0.5"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.
@@ -152,6 +154,7 @@ written `Db` with no generics in the common case.
 | `begin_serializable` | `fn begin_serializable(&self) -> Transaction<S>` | Start a serializable transaction (read set validated at commit). Requires the `serializable` feature. |
 | `snapshot` | `fn snapshot(&self) -> Snapshot<S>` | Take a read-only, point-in-time view. |
 | `last_committed` | `fn last_committed(&self) -> Timestamp` | The timestamp of the most recent commit; `Timestamp::ZERO` if none. |
+| `collect_garbage` | `fn collect_garbage(&self) -> usize` | Reclaim versions no live transaction or snapshot can observe; returns the count removed. |
 | `clone` | `fn clone(&self) -> Self` | A new handle to the same database. |
 
 `begin`, `begin_serializable`, and `snapshot` all capture the current commit
@@ -417,6 +420,7 @@ metadata is available to portfolio tooling). It is `#[non_exhaustive]`: a
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `is_retryable` | `fn is_retryable(&self) -> bool` | `true` for `Conflict`; the signal to re-run the transaction. |
+| `conflict` | `fn conflict(key_len: usize) -> TxnError` | Build a `Conflict` error. A custom store returns this from `try_commit` when validation fails; pass the conflicting key's length. |
 | `store` | `fn store(context: &'static str, detail: impl Display) -> TxnError` | Build a `Store` error; for custom store implementations. |
 
 **Examples**
@@ -462,13 +466,22 @@ pub trait VersionStore: Send + Sync {
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
     ) -> Result<()>;
+
+    // Provided method (default no-op); override to reclaim history.
+    fn collect_garbage(&self, low_watermark: Timestamp) -> usize { 0 }
 }
 ```
 
 The Tier-3 seam: the backend a [`Db`](#db) is built on. The transaction layer
 supplies the snapshot timestamps and the read and write sets; the store stores
 versions and is the serialization point that validates and applies each commit
-atomically. Implementations must be `Send + Sync`.
+atomically. Implementations must be `Send + Sync`. Only `get` and `try_commit`
+are required; `collect_garbage` defaults to doing nothing.
+
+A custom store signals a conflict from `try_commit` with
+[`TxnError::conflict`](#txnerror), and a backend failure with
+[`TxnError::store`](#txnerror) — see [Implementing a custom
+store](#implementing-a-custom-store).
 
 #### Contract
 
@@ -476,6 +489,7 @@ atomically. Implementations must be `Send + Sync`.
 |--------|------------|
 | `get` | Return the newest version of `key` whose commit timestamp is `<= read_ts`. A tombstone at that position reads as `None`. |
 | `try_commit` | As one step, atomic against any other `try_commit` touching an overlapping key: **validate** that no key in `writes` or `reads` has a version newer than `read_ts`, and if all pass, **apply** each write as a new version stamped `commit_ts`. `reads` is empty for snapshot-isolation transactions and carries the read set for serializable ones. The database hands out `commit_ts` uniquely and in increasing order. |
+| `collect_garbage` | Reclaim versions no reader at or after `low_watermark` can observe, returning the count removed. Defaults to a no-op, so a store that keeps no history need not implement it. |
 
 **Errors**: `try_commit` returns [`TxnError::Conflict`](#txnerror) if validation
 fails (nothing is applied). Any method may return [`TxnError::Store`](#txnerror)
@@ -748,11 +762,42 @@ mid-append — is discarded when the log is opened, so recovery always yields a
 clean prefix of commits. Commit timestamps resume strictly after the highest
 recovered timestamp.
 
+### Reclaiming old versions
+
+Versions accumulate as keys are overwritten. Call [`collect_garbage`](#db)
+periodically — or after retiring long-running snapshots — to reclaim the
+versions no live reader can observe. A held snapshot pins what it can see, so
+collection never removes data a reader still needs.
+
+```rust
+use txn_db::Db;
+
+let db = Db::new();
+for v in 0..100u8 {
+    let mut tx = db.begin();
+    tx.put(b"k".to_vec(), vec![v]);
+    tx.commit()?;
+}
+
+// A held snapshot pins its versions...
+let snap = db.snapshot();
+let pinned = db.collect_garbage();   // reclaims older history, keeps what `snap` sees
+let _ = snap.get(b"k")?;             // still valid
+
+// ...released, the rest becomes reclaimable.
+drop(snap);
+let _ = db.collect_garbage();
+# let _ = pinned;
+# Ok::<(), txn_db::TxnError>(())
+```
+
 ### Implementing a custom store
 
-Wrap or replace the backing store through [`VersionStore`](#versionstore). This
-instrumented wrapper counts reads while delegating commit validation and apply to
-an inner store:
+Wrap or replace the backing store through [`VersionStore`](#versionstore). A
+custom store is the seam for backing the engine with an LSM tree, a B-tree, or a
+remote store; it returns [`TxnError::conflict`](#txnerror) when `try_commit`
+validation fails. This instrumented wrapper counts reads while delegating commit
+validation and apply to an inner store:
 
 ```rust
 use std::sync::Arc;

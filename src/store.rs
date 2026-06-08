@@ -136,6 +136,23 @@ pub trait VersionStore: Send + Sync {
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
     ) -> Result<()>;
+
+    /// Reclaim versions that no reader at or after `low_watermark` can observe,
+    /// returning how many were removed.
+    ///
+    /// For each key, the newest version with a commit timestamp at or below
+    /// `low_watermark` is the oldest one any live snapshot can still see;
+    /// versions older than it are unreachable and may be dropped. A key whose
+    /// only surviving version is a tombstone at or below the watermark may be
+    /// removed entirely.
+    ///
+    /// The default implementation does nothing, so a store that does not retain
+    /// history — or chooses not to collect — need not implement it. [`MemoryStore`]
+    /// overrides it.
+    fn collect_garbage(&self, low_watermark: Timestamp) -> usize {
+        let _ = low_watermark;
+        0
+    }
 }
 
 /// One stored version of a key: the timestamp it became visible and its value.
@@ -346,6 +363,35 @@ impl VersionStore for MemoryStore {
         }
         Ok(())
     }
+
+    fn collect_garbage(&self, low_watermark: Timestamp) -> usize {
+        let mut reclaimed = 0;
+        for shard in &self.shards {
+            let mut chains = sync::write(&shard.chains);
+            chains.retain(|_key, chain| {
+                // Versions at or below the watermark; the last of them is the
+                // oldest any live snapshot can still observe.
+                let visible = chain.partition_point(|v| v.commit_ts <= low_watermark);
+                if visible > 1 {
+                    // Drop everything before that oldest-observable version.
+                    reclaimed += visible - 1;
+                    let _ = chain.drain(0..visible - 1);
+                }
+                // A key whose only surviving version is a tombstone the watermark
+                // has passed is absent for every live reader: drop it entirely.
+                if chain.len() == 1
+                    && chain[0].commit_ts <= low_watermark
+                    && chain[0].value.is_none()
+                {
+                    reclaimed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        reclaimed
+    }
 }
 
 /// Whether `key`'s newest version (if any) was committed after `read_ts` — the
@@ -501,5 +547,73 @@ mod tests {
         let store = MemoryStore::with_shards(5);
         assert_eq!(store.shards.len(), 8);
         assert_eq!(store.mask, 7);
+    }
+
+    #[test]
+    fn test_gc_prunes_versions_below_watermark_but_keeps_newest_visible() {
+        let store = MemoryStore::new();
+        commit(&store, 1, vec![(k(b"x"), Some(k(b"a")))]);
+        commit(&store, 2, vec![(k(b"x"), Some(k(b"b")))]);
+        commit(&store, 3, vec![(k(b"x"), Some(k(b"c")))]);
+
+        // A reader at timestamp 2 must still see "b", so GC at watermark 2 keeps
+        // the version at 2 and everything newer, dropping only the version at 1.
+        let reclaimed = store.collect_garbage(Timestamp::from_raw(2));
+        assert_eq!(reclaimed, 1);
+        assert_eq!(
+            store.get(b"x", Timestamp::from_raw(2)).unwrap().as_deref(),
+            Some(&b"b"[..])
+        );
+        assert_eq!(
+            store.get(b"x", Timestamp::from_raw(3)).unwrap().as_deref(),
+            Some(&b"c"[..])
+        );
+    }
+
+    #[test]
+    fn test_gc_drops_key_whose_only_survivor_is_a_passed_tombstone() {
+        let store = MemoryStore::new();
+        commit(&store, 1, vec![(k(b"x"), Some(k(b"a")))]);
+        commit(&store, 2, vec![(k(b"x"), None)]); // delete
+
+        // At watermark 5 the key is absent for everyone; it is dropped whole.
+        let reclaimed = store.collect_garbage(Timestamp::from_raw(5));
+        assert_eq!(reclaimed, 2);
+        assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn test_gc_keeps_everything_above_watermark() {
+        let store = MemoryStore::new();
+        commit(&store, 5, vec![(k(b"x"), Some(k(b"a")))]);
+        commit(&store, 6, vec![(k(b"x"), Some(k(b"b")))]);
+
+        // A watermark below all versions reclaims nothing.
+        assert_eq!(store.collect_garbage(Timestamp::from_raw(4)), 0);
+        assert_eq!(
+            store.get(b"x", Timestamp::from_raw(5)).unwrap().as_deref(),
+            Some(&b"a"[..])
+        );
+    }
+
+    #[test]
+    fn test_default_trait_gc_is_noop() {
+        // A bare trait object using the default never reclaims.
+        struct NoHistory;
+        impl VersionStore for NoHistory {
+            fn get(&self, _: &[u8], _: Timestamp) -> Result<Option<Arc<[u8]>>> {
+                Ok(None)
+            }
+            fn try_commit(
+                &self,
+                _: Timestamp,
+                _: Timestamp,
+                _: Vec<WriteEntry>,
+                _: &[Arc<[u8]>],
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(NoHistory.collect_garbage(Timestamp::from_raw(100)), 0);
     }
 }

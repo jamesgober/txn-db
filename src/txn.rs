@@ -11,11 +11,13 @@
 //! Transactions run under snapshot isolation by default. A serializable
 //! transaction (from [`Db::begin_serializable`](crate::Db::begin_serializable),
 //! behind the `serializable` feature) additionally records every key it reads so
-//! that the read set can be validated at commit; that is the only behavioral
-//! difference, and it is invisible to a snapshot-isolation transaction.
+//! that the read set can be validated at commit.
 //!
-//! A [`Snapshot`] is the read-only counterpart: a consistent, point-in-time
-//! view with no write buffer and nothing to commit.
+//! Both a transaction and a [`Snapshot`] hold an [`ActiveReader`], which
+//! registers the read timestamp with the database while the handle is alive and
+//! unregisters it on drop. That registry is what lets garbage collection know
+//! the oldest snapshot still in use, so it never reclaims a version a live reader
+//! can still observe.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,13 +28,39 @@ use crate::error::Result;
 use crate::store::{MemoryStore, VersionStore};
 use crate::timestamp::Timestamp;
 
+/// A handle's registration in the database's live-reader set.
+///
+/// Constructing one registers a read timestamp; dropping it unregisters that
+/// timestamp. Holding it keeps the database from garbage-collecting versions the
+/// reader can still see. It is a field of both [`Transaction`] and [`Snapshot`]
+/// rather than a `Drop` on those types directly, so a transaction can still move
+/// its write buffer out at commit.
+struct ActiveReader<S: VersionStore> {
+    inner: Arc<Inner<S>>,
+    read_ts: Timestamp,
+}
+
+impl<S: VersionStore> ActiveReader<S> {
+    /// Register a reader against `inner`, reading at the current watermark.
+    fn new(inner: Arc<Inner<S>>) -> Self {
+        let read_ts = inner.begin_reader();
+        ActiveReader { inner, read_ts }
+    }
+}
+
+impl<S: VersionStore> Drop for ActiveReader<S> {
+    fn drop(&mut self) {
+        self.inner.end_reader(self.read_ts);
+    }
+}
+
 /// A read-write transaction over a consistent snapshot of the database.
 ///
 /// A transaction is created by [`Db::begin`](crate::Db::begin) (snapshot
-/// isolation) or `Db::begin_serializable` (serializable, with the
-/// `serializable` feature). It reads as of the snapshot timestamp captured at
-/// that moment, so concurrent commits by other transactions are invisible to it.
-/// Writes are buffered in the transaction and become visible to others only when
+/// isolation) or `Db::begin_serializable` (serializable, with the `serializable`
+/// feature). It reads as of the snapshot timestamp captured at that moment, so
+/// concurrent commits by other transactions are invisible to it. Writes are
+/// buffered in the transaction and become visible to others only when
 /// [`commit`](Transaction::commit) succeeds; within the transaction, a read of a
 /// key it has written returns that pending write (read-your-own-writes).
 ///
@@ -66,8 +94,7 @@ use crate::timestamp::Timestamp;
 /// ```
 #[must_use = "a transaction buffers writes that are discarded unless it is committed"]
 pub struct Transaction<S: VersionStore = MemoryStore> {
-    inner: Arc<Inner<S>>,
-    read_ts: Timestamp,
+    active: ActiveReader<S>,
     writes: HashMap<Arc<[u8]>, Option<Arc<[u8]>>>,
     /// The set of keys read from the snapshot, tracked only for serializable
     /// transactions. `None` under snapshot isolation, where reads are not
@@ -77,13 +104,11 @@ pub struct Transaction<S: VersionStore = MemoryStore> {
 }
 
 impl<S: VersionStore> Transaction<S> {
-    /// Construct a transaction over `inner` reading at `read_ts`. When
-    /// `serializable` is set the transaction records its read set for validation
-    /// at commit.
-    pub(crate) fn new(inner: Arc<Inner<S>>, read_ts: Timestamp, serializable: bool) -> Self {
+    /// Construct a transaction over `inner`. When `serializable` is set the
+    /// transaction records its read set for validation at commit.
+    pub(crate) fn new(inner: Arc<Inner<S>>, serializable: bool) -> Self {
         Transaction {
-            inner,
-            read_ts,
+            active: ActiveReader::new(inner),
             writes: HashMap::new(),
             reads: serializable.then(|| RefCell::new(HashSet::new())),
         }
@@ -107,7 +132,7 @@ impl<S: VersionStore> Transaction<S> {
     #[inline]
     #[must_use]
     pub fn read_timestamp(&self) -> Timestamp {
-        self.read_ts
+        self.active.read_ts
     }
 
     /// Read the value of `key` as this transaction sees it.
@@ -144,7 +169,7 @@ impl<S: VersionStore> Transaction<S> {
         if let Some(pending) = self.writes.get(key) {
             return Ok(pending.clone());
         }
-        let value = self.inner.store.get(key, self.read_ts)?;
+        let value = self.active.inner.store.get(key, self.active.read_ts)?;
         // A serializable transaction records the key — present or absent — so a
         // later writer to it is caught at commit.
         if let Some(reads) = &self.reads {
@@ -222,7 +247,9 @@ impl<S: VersionStore> Transaction<S> {
     /// committed after this one's snapshot, or, for a serializable transaction,
     /// if any key it read has since changed. In either case no writes are
     /// applied. Returns [`TxnError::Store`](crate::TxnError::Store) if the
-    /// backing store fails to apply the batch.
+    /// backing store fails to apply the batch, or
+    /// [`TxnError::Durability`](crate::TxnError::Durability) if a durable commit
+    /// cannot be made durable.
     ///
     /// # Examples
     ///
@@ -237,8 +264,9 @@ impl<S: VersionStore> Transaction<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn commit(self) -> Result<Timestamp> {
+        let read_ts = self.active.read_ts;
         if self.writes.is_empty() {
-            return Ok(self.read_ts);
+            return Ok(read_ts);
         }
         // The read set, minus keys also in the write set (those are covered by
         // the write-write check). Empty for snapshot-isolation transactions.
@@ -251,7 +279,7 @@ impl<S: VersionStore> Transaction<S> {
             None => Vec::new(),
         };
         let batch = self.writes.into_iter().collect();
-        self.inner.commit_writes(self.read_ts, batch, &reads)
+        self.active.inner.commit_writes(read_ts, batch, &reads)
     }
 
     /// Discard the transaction and all of its buffered writes.
@@ -275,8 +303,9 @@ impl<S: VersionStore> Transaction<S> {
     /// ```
     #[inline]
     pub fn rollback(self) {
-        // Dropping `self` releases the buffered writes; this method documents
-        // the intent and consumes the transaction so it cannot be used again.
+        // Dropping `self` releases the buffered writes and unregisters the
+        // reader; this method documents the intent and consumes the transaction
+        // so it cannot be used again.
     }
 }
 
@@ -285,8 +314,8 @@ impl<S: VersionStore> Transaction<S> {
 /// A snapshot is created by [`Db::snapshot`](crate::Db::snapshot) and reads as
 /// of the moment it was taken. It has no write buffer and nothing to commit, so
 /// it is cheaper than a transaction when all you need is to read several keys at
-/// one consistent instant. Multiple snapshots and transactions coexist without
-/// blocking each other.
+/// one consistent instant. While it is alive it pins that instant: garbage
+/// collection will not reclaim a version the snapshot can still observe.
 ///
 /// # Examples
 ///
@@ -310,14 +339,15 @@ impl<S: VersionStore> Transaction<S> {
 /// # Ok::<(), txn_db::TxnError>(())
 /// ```
 pub struct Snapshot<S: VersionStore = MemoryStore> {
-    inner: Arc<Inner<S>>,
-    read_ts: Timestamp,
+    active: ActiveReader<S>,
 }
 
 impl<S: VersionStore> Snapshot<S> {
-    /// Construct a snapshot over `inner` reading at `read_ts`.
-    pub(crate) fn new(inner: Arc<Inner<S>>, read_ts: Timestamp) -> Self {
-        Snapshot { inner, read_ts }
+    /// Construct a snapshot over `inner`, reading at the current watermark.
+    pub(crate) fn new(inner: Arc<Inner<S>>) -> Self {
+        Snapshot {
+            active: ActiveReader::new(inner),
+        }
     }
 
     /// The timestamp this snapshot reads at.
@@ -333,7 +363,7 @@ impl<S: VersionStore> Snapshot<S> {
     #[inline]
     #[must_use]
     pub fn read_timestamp(&self) -> Timestamp {
-        self.read_ts
+        self.active.read_ts
     }
 
     /// Read the value of `key` as of this snapshot.
@@ -356,6 +386,6 @@ impl<S: VersionStore> Snapshot<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>> {
-        self.inner.store.get(key, self.read_ts)
+        self.active.inner.store.get(key, self.active.read_ts)
     }
 }

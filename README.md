@@ -41,20 +41,16 @@
 
 <h2>What it does</h2>
 
-Available now (`0.4`):
+Available now (`0.5`, feature-complete):
 
 - **MVCC** &mdash; each write creates a new version; readers see a consistent snapshot without blocking writers
 - **Snapshot isolation** &mdash; a transaction reads the database as of its start timestamp; its own writes are visible to itself before commit
 - **Serializable (SSI)** &mdash; opt-in read-set validation under the `serializable` feature, rejecting write skew and the read-only anomaly
 - **Durable commit log** &mdash; under the `durability` feature, `Db::open` logs each commit to a `wal-db` write-ahead log and syncs before acknowledging; the log is replayed on restart
+- **Garbage collection** &mdash; `Db::collect_garbage` reclaims versions no live transaction or snapshot can observe; an oldest-reader watermark guarantees a held snapshot's versions are never reclaimed
 - **Write-write conflict detection** &mdash; first-committer-wins at commit; the later writer is told to retry with a typed, retryable error
 - **Sharded commit path** &mdash; lock-free timestamp allocation and per-shard conflict checks, so commits to unrelated keys do not contend (loom-checked)
-- **Pluggable backing store** &mdash; the version store is the `VersionStore` trait; an in-memory store ships, and any backend plugs in
-
-On the roadmap:
-
-- **Garbage collection** &mdash; old versions reclaimed once no live snapshot can observe them
-- **Backing-store integration** &mdash; compose over `lsm-db` or any store through the trait
+- **Pluggable backing store** &mdash; the version store is the `VersionStore` trait; an in-memory store ships, and any backend (an LSM tree, a B-tree, a remote store) plugs in unchanged
 
 
 <br>
@@ -63,10 +59,10 @@ On the roadmap:
 
 ```toml
 [dependencies]
-txn-db = "0.4"
+txn-db = "0.5"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "0.4", features = ["serializable", "durability"] }
+txn-db = { version = "0.5", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -183,6 +179,34 @@ assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&b"v"[..]));
 See [`examples/durable_store.rs`](./examples/durable_store.rs) for a commit /
 drop / reopen walkthrough.
 
+## Garbage collection
+
+Every write keeps the previous version so in-flight readers see a stable
+snapshot, so versions accumulate. `Db::collect_garbage` reclaims the versions no
+live transaction or snapshot can still observe and returns how many it removed.
+A held snapshot pins the versions it can see, so collection never reclaims data
+a live reader depends on.
+
+```rust
+use txn_db::Db;
+
+let db = Db::new();
+for v in 0..100u8 {
+    let mut tx = db.begin();
+    tx.put(b"k".to_vec(), vec![v]);
+    tx.commit()?;
+}
+
+// With no snapshot held, only the newest version need be kept.
+let reclaimed = db.collect_garbage();
+assert!(reclaimed > 0);
+assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&[99u8][..]));
+# Ok::<(), txn_db::TxnError>(())
+```
+
+See [`examples/garbage_collection.rs`](./examples/garbage_collection.rs) for a
+demonstration of a held snapshot pinning versions against collection.
+
 <br>
 
 ## Examples
@@ -196,9 +220,11 @@ drop / reopen walkthrough.
 | [`custom_store`](./examples/custom_store.rs) | Backing the engine with a custom `VersionStore`. |
 | [`serializable_doctors`](./examples/serializable_doctors.rs) | Write skew under SI vs serializable (needs `--features serializable`). |
 | [`durable_store`](./examples/durable_store.rs) | Commit, drop, reopen — recovery from the log (needs `--features durability`). |
+| [`garbage_collection`](./examples/garbage_collection.rs) | Reclaiming old versions; a held snapshot pins what it can see. |
 
 ```bash
 cargo run --example quick_start
+cargo run --example garbage_collection
 cargo run --example serializable_doctors --features serializable
 cargo run --example durable_store --features durability
 ```
@@ -207,13 +233,14 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is the `0.4` release: the MVCC core, snapshot and serializable isolation,
-and a sharded lock-free commit path, now with a durable commit log via `wal-db`
-(the `durability` feature) and log replay on restart. The
-[`docs/API.md`](./docs/API.md) reference documents the full Tier-1 surface, and
-the remaining phases — version garbage collection and backing-store integration
-— follow per the roadmap. The shape of the Tier-1 API is settled and will not
-change before `1.0`.
+This is the `0.5` release, and the engine is **feature-complete**: MVCC with
+snapshot and serializable isolation, a sharded lock-free commit path, a durable
+commit log via `wal-db`, and watermark-driven garbage collection, all over a
+pluggable `VersionStore`. The [`docs/API.md`](./docs/API.md) reference documents
+the full surface. What remains before `1.0` is hardening, not new features:
+optimization (`0.6`) and adversarial/cross-platform hardening with the API
+formally frozen (`0.7`). The Tier-1 API is settled and will not change before
+`1.0`.
 
 <hr>
 <br>

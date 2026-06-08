@@ -86,9 +86,25 @@ pub enum TxnError {
 
 impl TxnError {
     /// Build a [`TxnError::Conflict`] for a key of the given length.
+    ///
+    /// A custom [`VersionStore`](crate::VersionStore) returns this from
+    /// [`try_commit`](crate::VersionStore::try_commit) when validation detects
+    /// that a written or read key changed after the transaction's snapshot. Pass
+    /// the conflicting key's length; its bytes are deliberately not carried, so
+    /// the error stays safe to log. The shipped in-memory store uses this
+    /// internally.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::TxnError;
+    ///
+    /// let err = TxnError::conflict(b"account:42".len());
+    /// assert!(err.is_retryable());
+    /// ```
     #[inline]
     #[must_use]
-    pub(crate) fn conflict(key_len: usize) -> Self {
+    pub fn conflict(key_len: usize) -> Self {
         TxnError::Conflict { key_len }
     }
 

@@ -18,7 +18,7 @@
 //! the bookkeeping that advances the watermark as commits complete takes a
 //! short mutex.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::sync::{self, AtomicU64, Mutex, Ordering};
 use crate::timestamp::Timestamp;
@@ -33,6 +33,13 @@ pub(crate) struct Oracle {
     read_ts: AtomicU64,
     /// Bookkeeping for advancing the watermark as commits finish out of order.
     pending: Mutex<Pending>,
+    /// The read timestamps of every live transaction and snapshot, each with a
+    /// reference count. The smallest key is the oldest snapshot still in use and
+    /// drives garbage collection: a version older than what that snapshot can
+    /// observe is unreachable. A reader's timestamp is read from the watermark
+    /// under this lock when it registers, so garbage collection can never run
+    /// against a low watermark a not-yet-registered reader would undercut.
+    readers: Mutex<BTreeMap<u64, usize>>,
 }
 
 /// The mutable watermark state, guarded by [`Oracle::pending`].
@@ -55,6 +62,7 @@ impl Oracle {
                 done_upto: Timestamp::ZERO.get(),
                 ahead: HashSet::new(),
             }),
+            readers: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -74,6 +82,7 @@ impl Oracle {
                 done_upto: highest,
                 ahead: HashSet::new(),
             }),
+            readers: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -88,6 +97,50 @@ impl Oracle {
     #[inline]
     pub(crate) fn alloc_commit_ts(&self) -> Timestamp {
         Timestamp::from_raw(self.next_ts.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Register a new reader and return the timestamp it should read at.
+    ///
+    /// Reading the watermark while holding the registry lock is what makes
+    /// garbage collection safe: a reader is recorded at the same instant its
+    /// timestamp is chosen, so [`low_watermark`](Self::low_watermark) can never
+    /// observe an empty registry and reclaim versions that this reader — having
+    /// just taken the same or an earlier timestamp — would still need.
+    pub(crate) fn begin_reader(&self) -> Timestamp {
+        let mut readers = sync::lock(&self.readers);
+        let ts = self.read_ts.load(Ordering::Acquire);
+        *readers.entry(ts).or_insert(0) += 1;
+        Timestamp::from_raw(ts)
+    }
+
+    /// Drop a reader registered at `ts`.
+    pub(crate) fn end_reader(&self, ts: Timestamp) {
+        let key = ts.get();
+        let mut readers = sync::lock(&self.readers);
+        let now_zero = match readers.get_mut(&key) {
+            Some(count) => {
+                *count -= 1;
+                *count == 0
+            }
+            None => false,
+        };
+        if now_zero {
+            let _ = readers.remove(&key);
+        }
+    }
+
+    /// The oldest timestamp any live reader can still observe.
+    ///
+    /// This is the smallest registered reader timestamp, or — when no reader is
+    /// live — the current watermark, since any reader that begins next will read
+    /// at or after it. Versions strictly older than the newest version at or
+    /// below this timestamp are unreachable and may be reclaimed.
+    pub(crate) fn low_watermark(&self) -> Timestamp {
+        let readers = sync::lock(&self.readers);
+        match readers.keys().next() {
+            Some(&oldest) => Timestamp::from_raw(oldest),
+            None => Timestamp::from_raw(self.read_ts.load(Ordering::Acquire)),
+        }
     }
 
     /// Record that the commit (or aborted attempt) holding `ts` has finished, and

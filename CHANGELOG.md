@@ -18,6 +18,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.5.0] - 2026-06-07
+
+Garbage collection, a proven backing-store seam, and **feature freeze**: the
+engine is feature-complete. What remains before 1.0 is hardening, not new
+features.
+
+### Added
+
+- `Db::collect_garbage` — reclaim versions no live transaction or snapshot can
+  observe, returning the count removed. Driven by an oldest-live-reader
+  watermark: a held snapshot pins the versions it can see, so collection never
+  reclaims data a reader still needs.
+- `VersionStore::collect_garbage` — a provided trait method (default no-op) so a
+  store that keeps history can prune it; `MemoryStore` implements it.
+- An active-reader registry in the timestamp oracle: every transaction and
+  snapshot registers its read timestamp for the lifetime of the handle, so the
+  garbage-collection watermark knows the oldest snapshot still in use. The read
+  timestamp is taken under the registry lock, closing the race where a
+  not-yet-registered reader could be undercut by a concurrent collection.
+- `TxnError::conflict` is now public, so a custom `VersionStore` can signal a
+  write-write or read-set conflict from `try_commit`.
+- Garbage-collection property tests (`tests/gc.rs`): across arbitrary
+  interleavings of writes, deletes, snapshots, and collections, every held
+  snapshot keeps reading exactly what it saw.
+- Backing-store integration test (`tests/backing_store.rs`): a complete,
+  independent `VersionStore` (a single-locked `BTreeMap`, sharing no code with
+  `MemoryStore`) carries the full transaction semantics — snapshot isolation,
+  conflict detection, and serializable read-set validation — proving the trait
+  is a real seam.
+- `examples/garbage_collection.rs` — version reclamation with a held snapshot
+  pinning what it can see.
+
+### Changed
+
+- Feature freeze declared: the public surface is complete. Subsequent 0.x
+  releases are optimization (`0.6`) and hardening with the API formally frozen
+  (`0.7`), per the roadmap.
+
+---
+
 ## [0.4.0] - 2026-06-07
 
 Durability release: a write-ahead commit log via `wal-db`, with log replay on
@@ -163,7 +203,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/txn-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/txn-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/txn-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/txn-db/compare/v0.1.0...v0.2.0

@@ -54,6 +54,23 @@ impl<S: VersionStore> Inner<S> {
         self.oracle.read_ts()
     }
 
+    /// Register a live reader and return its read timestamp.
+    #[inline]
+    pub(crate) fn begin_reader(&self) -> Timestamp {
+        self.oracle.begin_reader()
+    }
+
+    /// Unregister a reader that began at `read_ts`.
+    #[inline]
+    pub(crate) fn end_reader(&self, read_ts: Timestamp) {
+        self.oracle.end_reader(read_ts);
+    }
+
+    /// Reclaim versions no live reader can observe, returning the count removed.
+    fn collect_garbage(&self) -> usize {
+        self.store.collect_garbage(self.oracle.low_watermark())
+    }
+
     /// Allocate a commit timestamp, validate-and-apply through the store, then
     /// release the timestamp into the watermark.
     ///
@@ -303,7 +320,7 @@ impl<S: VersionStore> Db<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn begin(&self) -> Transaction<S> {
-        Transaction::new(Arc::clone(&self.inner), self.inner.read_ts(), false)
+        Transaction::new(Arc::clone(&self.inner), false)
     }
 
     /// Begin a serializable transaction over the current state.
@@ -345,7 +362,7 @@ impl<S: VersionStore> Db<S> {
     #[cfg(feature = "serializable")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serializable")))]
     pub fn begin_serializable(&self) -> Transaction<S> {
-        Transaction::new(Arc::clone(&self.inner), self.inner.read_ts(), true)
+        Transaction::new(Arc::clone(&self.inner), true)
     }
 
     /// Take a read-only snapshot of the current state of the database.
@@ -365,7 +382,7 @@ impl<S: VersionStore> Db<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn snapshot(&self) -> Snapshot<S> {
-        Snapshot::new(Arc::clone(&self.inner), self.inner.read_ts())
+        Snapshot::new(Arc::clone(&self.inner))
     }
 
     /// The timestamp of the most recent commit visible to a new transaction.
@@ -391,6 +408,46 @@ impl<S: VersionStore> Db<S> {
     #[must_use]
     pub fn last_committed(&self) -> Timestamp {
         self.inner.read_ts()
+    }
+
+    /// Reclaim versions that no live transaction or snapshot can observe,
+    /// returning how many were removed.
+    ///
+    /// `txn-db` keeps every version of a key so that an in-flight reader sees a
+    /// stable snapshot. Once no live reader can observe an old version — because
+    /// every active transaction and snapshot reads at a timestamp newer than a
+    /// later version of that key — the old one is unreachable and this reclaims
+    /// it. A key deleted before the oldest live reader's snapshot is dropped
+    /// entirely.
+    ///
+    /// Call it periodically, or after retiring long-running snapshots, to bound
+    /// memory. It is safe to call at any time and from any thread: a version a
+    /// live reader can still reach is never reclaimed. With the default
+    /// in-memory store this prunes the version chains; a custom
+    /// [`VersionStore`](crate::VersionStore) that keeps no history can leave the
+    /// default no-op in place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::Db;
+    ///
+    /// let db = Db::new();
+    /// // Overwrite the same key several times.
+    /// for v in 0..5u8 {
+    ///     let mut tx = db.begin();
+    ///     tx.put(b"k".to_vec(), vec![v]);
+    ///     tx.commit()?;
+    /// }
+    ///
+    /// // No snapshot is held, so only the newest version need be kept.
+    /// let reclaimed = db.collect_garbage();
+    /// assert!(reclaimed > 0);
+    /// assert_eq!(db.begin().get(b"k")?.as_deref(), Some(&[4u8][..]));
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    pub fn collect_garbage(&self) -> usize {
+        self.inner.collect_garbage()
     }
 }
 
@@ -484,6 +541,43 @@ mod tests {
         tx.put(b"k".to_vec(), b"v".to_vec());
         tx.rollback();
         assert_eq!(db.begin().get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_gc_reclaims_when_no_reader_is_held() {
+        let db = Db::new();
+        for v in 0..5u8 {
+            let mut tx = db.begin();
+            tx.put(b"k".to_vec(), vec![v]);
+            let _ = tx.commit().unwrap();
+        }
+        let reclaimed = db.collect_garbage();
+        assert!(reclaimed > 0);
+        assert_eq!(db.begin().get(b"k").unwrap().as_deref(), Some(&[4u8][..]));
+    }
+
+    #[test]
+    fn test_held_snapshot_pins_gc() {
+        let db = Db::new();
+        let mut tx = db.begin();
+        tx.put(b"k".to_vec(), vec![1]);
+        let _ = tx.commit().unwrap();
+
+        // Hold a snapshot of this state, then overwrite the key.
+        let snap = db.snapshot();
+        let mut tx = db.begin();
+        tx.put(b"k".to_vec(), vec![2]);
+        let _ = tx.commit().unwrap();
+
+        // GC must not reclaim the version the held snapshot still observes.
+        let _ = db.collect_garbage();
+        assert_eq!(snap.get(b"k").unwrap().as_deref(), Some(&[1u8][..]));
+
+        // Once the snapshot is dropped, the old version becomes reclaimable.
+        drop(snap);
+        let reclaimed = db.collect_garbage();
+        assert!(reclaimed > 0);
+        assert_eq!(db.begin().get(b"k").unwrap().as_deref(), Some(&[2u8][..]));
     }
 
     #[test]

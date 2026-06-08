@@ -20,8 +20,9 @@
 > the 0.x series. The Tier-1 surface documented here is settled as of `0.2` and
 > will not change shape before `1.0`; serializable isolation was added in `0.3`,
 > a durable commit log in `0.4`, and garbage collection in `0.5` — at which point
-> the engine is feature-complete. Sections marked _(planned)_ describe an
-> intended surface that has not shipped yet.
+> the engine is feature-complete. `0.6` is an optimization release with no API
+> changes (see [`PERFORMANCE.md`](./PERFORMANCE.md)). Sections marked _(planned)_
+> describe an intended surface that has not shipped yet.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -67,7 +68,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.5"
+txn-db = "0.6"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.

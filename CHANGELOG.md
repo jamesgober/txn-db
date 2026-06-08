@@ -18,6 +18,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.6.0] - 2026-06-07
+
+Optimization release: the commit hot path is profiled and tuned, and the
+contention-scaling behavior is benchmarked and documented. No API changes.
+
+### Added
+
+- `benches/contention.rs` — contention-scaling benchmarks (disjoint commits,
+  single-key contended commits, and begin/drop) across 1, 4, 16, and 64
+  concurrent writers.
+- `docs/PERFORMANCE.md` — single-threaded hot-path latencies, the
+  contention-scaling curve, the optimization log, and the reproduction
+  methodology.
+
+### Changed
+
+- `MemoryStore::try_commit` gained a single-write fast path: a commit of one key
+  with no read set to validate now locks one shard and applies directly, skipping
+  the shard-index vectors, sort, dedup, guard vector, and key-to-guard binary
+  searches the general multi-key path needs. Measured against the v0.5 general
+  path: single-key commit −45%, single-key batch −41%, read-modify-write −37%;
+  point reads and large multi-key batches unchanged. No benchmark regressed.
+
+---
+
 ## [0.5.0] - 2026-06-07
 
 Garbage collection, a proven backing-store seam, and **feature freeze**: the
@@ -203,7 +228,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/txn-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/txn-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/txn-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/txn-db/compare/v0.2.0...v0.3.0

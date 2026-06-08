@@ -316,6 +316,26 @@ impl VersionStore for MemoryStore {
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
     ) -> Result<()> {
+        // Fast path for the dominant shape — a single write with no read set to
+        // validate. It locks one shard and skips the per-shard bookkeeping
+        // (shard-index vectors, sort, dedup, guard vector, and the binary
+        // searches that map keys back to guards) the general path needs for
+        // multi-key, multi-shard commits.
+        if writes.len() == 1 && reads.is_empty() {
+            let shard = self.shard_of(&writes[0].0);
+            let mut chains = sync::write(&self.shards[shard].chains);
+            if newer_than(chains.get(writes[0].0.as_ref()), read_ts) {
+                return Err(TxnError::conflict(writes[0].0.len()));
+            }
+            for (key, value) in writes {
+                chains
+                    .entry(key)
+                    .or_default()
+                    .push(Version { commit_ts, value });
+            }
+            return Ok(());
+        }
+
         // Shard of every touched key, computed once.
         let write_shards: Vec<usize> = writes.iter().map(|(k, _)| self.shard_of(k)).collect();
         let read_shards: Vec<usize> = reads.iter().map(|k| self.shard_of(k)).collect();

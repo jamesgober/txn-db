@@ -59,10 +59,10 @@ Available now (`0.5`, feature-complete):
 
 ```toml
 [dependencies]
-txn-db = "0.5"
+txn-db = "0.6"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "0.5", features = ["serializable", "durability"] }
+txn-db = { version = "0.6", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -233,14 +233,16 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is the `0.5` release, and the engine is **feature-complete**: MVCC with
+This is the `0.6` release: the feature-complete engine of `0.5` — MVCC with
 snapshot and serializable isolation, a sharded lock-free commit path, a durable
-commit log via `wal-db`, and watermark-driven garbage collection, all over a
-pluggable `VersionStore`. The [`docs/API.md`](./docs/API.md) reference documents
-the full surface. What remains before `1.0` is hardening, not new features:
-optimization (`0.6`) and adversarial/cross-platform hardening with the API
-formally frozen (`0.7`). The Tier-1 API is settled and will not change before
-`1.0`.
+commit log via `wal-db`, and watermark-driven garbage collection — with the
+commit hot path profiled and tuned. The single-write commit fast path cuts
+single-key commit latency by roughly 40%; see
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) for hot-path numbers and the
+contention-scaling curve. The [`docs/API.md`](./docs/API.md) reference documents
+the full surface. What remains before `1.0` is adversarial and cross-platform
+hardening with the API formally frozen (`0.7`). The Tier-1 API is settled and
+will not change before `1.0`.
 
 <hr>
 <br>

@@ -617,6 +617,72 @@ mod tests {
     }
 
     #[test]
+    fn test_extreme_timestamps_order_correctly() {
+        // Versions at the top of the u64 range must still be ordered and read
+        // back correctly — the version chain uses no arithmetic that could wrap.
+        let store = MemoryStore::new();
+        let near_max = Timestamp::from_raw(u64::MAX - 1);
+        let max = Timestamp::from_raw(u64::MAX);
+        store
+            .try_commit(
+                Timestamp::ZERO,
+                near_max,
+                vec![(k(b"x"), Some(k(b"a")))],
+                &[],
+            )
+            .unwrap();
+        store
+            .try_commit(near_max, max, vec![(k(b"x"), Some(k(b"b")))], &[])
+            .unwrap();
+
+        assert_eq!(
+            store.get(b"x", Timestamp::from_raw(u64::MAX - 2)).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.get(b"x", near_max).unwrap().as_deref(),
+            Some(&b"a"[..])
+        );
+        assert_eq!(store.get(b"x", max).unwrap().as_deref(), Some(&b"b"[..]));
+        // A conflict check at the very top of the range behaves normally.
+        let err = store
+            .try_commit(near_max, max, vec![(k(b"x"), Some(k(b"c")))], &[])
+            .unwrap_err();
+        assert!(matches!(err, TxnError::Conflict { .. }));
+    }
+
+    #[test]
+    fn test_gc_at_extreme_watermark() {
+        let store = MemoryStore::new();
+        store
+            .try_commit(
+                Timestamp::ZERO,
+                Timestamp::from_raw(u64::MAX - 1),
+                vec![(k(b"x"), Some(k(b"a")))],
+                &[],
+            )
+            .unwrap();
+        store
+            .try_commit(
+                Timestamp::from_raw(u64::MAX - 1),
+                Timestamp::from_raw(u64::MAX),
+                vec![(k(b"x"), Some(k(b"b")))],
+                &[],
+            )
+            .unwrap();
+        // Watermark at the max keeps only the newest visible version.
+        let reclaimed = store.collect_garbage(Timestamp::from_raw(u64::MAX));
+        assert_eq!(reclaimed, 1);
+        assert_eq!(
+            store
+                .get(b"x", Timestamp::from_raw(u64::MAX))
+                .unwrap()
+                .as_deref(),
+            Some(&b"b"[..])
+        );
+    }
+
+    #[test]
     fn test_default_trait_gc_is_noop() {
         // A bare trait object using the default never reclaims.
         struct NoHistory;

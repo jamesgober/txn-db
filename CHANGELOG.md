@@ -18,6 +18,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.7.0] - 2026-06-08
+
+Hardening release, and the **public API is frozen**: it will not change before
+2.0. Adversarial schedules, edge cases, and a cross-platform re-verification of
+the durable path all pass.
+
+### Added
+
+- `tests/adversarial.rs` — hardening tests: a long-running reader against a
+  collector running flat out, an abort storm (twelve threads × 400 increments on
+  one key, losing no update and finishing), a very large transaction (20k keys
+  across every shard), empty and 1 MiB keys/values, and a mixed per-thread
+  workload of puts, deletes, snapshots, and collection that ends in exactly the
+  state each thread last wrote.
+- Extreme-timestamp store tests: version ordering, visibility, conflict
+  detection, and collection at the top of the `u64` range.
+- A `loom` model check that garbage collection running concurrently with a reader
+  never disturbs what the reader sees.
+
+### Changed
+
+- **Public API frozen** (recorded in `.dev/ROADMAP.md`). No further API changes
+  before 2.0; remaining pre-1.0 work is a beta/RC soak.
+
+### Notes
+
+- Under concurrent out-of-order commits the read watermark can briefly lag a
+  thread's own most recent commit, so even a transaction writing only its own
+  keys may meet a retryable `Conflict`. This is correct snapshot-isolation
+  behavior — a spurious abort, never a lost update — and is handled by the normal
+  retry loop. Documented so it is not mistaken for a bug.
+
+---
+
 ## [0.6.0] - 2026-06-07
 
 Optimization release: the commit hot path is profiled and tuned, and the
@@ -228,7 +262,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/txn-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/txn-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/txn-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/txn-db/compare/v0.3.0...v0.4.0

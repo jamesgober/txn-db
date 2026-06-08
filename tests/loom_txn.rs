@@ -56,6 +56,41 @@ fn loom_same_key_commit_has_one_winner() {
     });
 }
 
+/// A reader runs concurrently with garbage collection. Whatever the interleaving
+/// of the snapshot's read (a shard read-lock) against the collector's pruning (a
+/// shard write-lock plus the reader-registry and watermark bookkeeping), the
+/// reader must always see the newest committed version — never a torn, empty, or
+/// reclaimed-out-from-under-it state.
+#[test]
+fn loom_gc_never_disturbs_a_concurrent_reader() {
+    loom::model(|| {
+        let db = Db::new();
+        // Two versions of one key, so the collector has an older version it is
+        // free to reclaim.
+        {
+            let mut tx = db.begin();
+            tx.put(vec![1u8], vec![1u8]);
+            tx.commit().unwrap();
+        }
+        {
+            let mut tx = db.begin();
+            tx.put(vec![1u8], vec![2u8]);
+            tx.commit().unwrap();
+        }
+
+        let reader = db.clone();
+        let handle = loom::thread::spawn(move || {
+            let snap = reader.snapshot();
+            snap.get(&[1u8]).unwrap()
+        });
+
+        db.collect_garbage();
+
+        let seen = handle.join().unwrap();
+        assert_eq!(seen.as_deref(), Some(&[2u8][..]));
+    });
+}
+
 /// Two transactions take the same snapshot and commit to disjoint keys
 /// concurrently. Neither conflicts, so both must commit, and once both have
 /// finished the read watermark must have advanced far enough that a fresh

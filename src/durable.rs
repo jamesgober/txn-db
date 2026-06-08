@@ -193,10 +193,57 @@ fn corrupt_tag(tag: u8) -> TxnError {
 #[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn entry(key: &[u8], value: Option<&[u8]>) -> WriteEntry {
         (Arc::from(key), value.map(Arc::from))
+    }
+
+    proptest! {
+        /// The decoder must treat its input as hostile: any byte string at all
+        /// either decodes or errors, but never panics and never tries to
+        /// allocate beyond the bytes present.
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = decode_commit(&bytes);
+        }
+
+        /// Encoding any well-formed commit and decoding it round-trips exactly,
+        /// including empty keys, empty values, tombstones, and duplicate keys.
+        #[test]
+        fn encode_decode_roundtrips_arbitrary(
+            ts in any::<u64>(),
+            writes in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 0..24),
+                    prop::option::of(prop::collection::vec(any::<u8>(), 0..24)),
+                ),
+                0..24,
+            ),
+        ) {
+            let entries: Vec<WriteEntry> = writes
+                .into_iter()
+                .map(|(k, v)| (Arc::from(k.as_slice()), v.map(|v| Arc::from(v.as_slice()))))
+                .collect();
+            let bytes = encode_for_log(Timestamp::from_raw(ts), &entries);
+            let decoded = decode_commit(&bytes).unwrap();
+            prop_assert_eq!(decoded.commit_ts, Timestamp::from_raw(ts));
+            prop_assert_eq!(decoded.writes, entries);
+        }
+
+        /// Any valid record with arbitrary trailing bytes appended must be
+        /// rejected — the decoder requires exact consumption.
+        #[test]
+        fn decode_rejects_arbitrary_trailing_bytes(
+            ts in any::<u64>(),
+            trailer in prop::collection::vec(any::<u8>(), 1..32),
+        ) {
+            let mut bytes = encode_for_log(Timestamp::from_raw(ts), &[entry(b"k", Some(b"v"))]);
+            bytes.extend_from_slice(&trailer);
+            prop_assert!(decode_commit(&bytes).is_err());
+        }
     }
 
     #[test]

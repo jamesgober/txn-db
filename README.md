@@ -59,17 +59,30 @@ Available now (`0.5`, feature-complete):
 
 ```toml
 [dependencies]
-txn-db = "0.7"
+txn-db = "0.8"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "0.7", features = ["serializable", "durability"] }
+txn-db = { version = "0.8", features = ["serializable", "durability"] }
 ```
 
 <br>
 
 ## Quick start
 
-The whole common case is begin, read and write through the transaction, commit:
+For a single read or write, skip the ceremony — `get`, `put`, and `delete` on
+the database run in their own transaction (writes retry on conflict):
+
+```rust
+use txn_db::Db;
+
+let db = Db::new();
+db.put(b"user:1:name".to_vec(), b"ada".to_vec())?;
+assert_eq!(db.get(b"user:1:name")?.as_deref(), Some(&b"ada"[..]));
+# Ok::<(), txn_db::TxnError>(())
+```
+
+When several operations must be atomic, open a transaction: begin, read and
+write through it, commit.
 
 ```rust
 use txn_db::Db;
@@ -233,15 +246,14 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is the `0.7` release: the feature-complete, tuned engine of `0.6`, now
-**hardened and with its public API frozen**. Adversarial schedules (long-running
-readers against aggressive garbage collection, abort storms on a hot key), edge
-cases (very large transactions, empty and large keys/values, timestamps at the
-top of the range), a `loom` check of garbage collection against a concurrent
-reader, and cross-platform re-verification of the durable path all pass. The
-public API will not change before `2.0`. See [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)
-for the hot-path numbers and the [`docs/API.md`](./docs/API.md) reference for the
-full surface. What remains before `1.0` is a beta/RC soak.
+This is the `0.8` release — the alpha in the run to `1.0`. The engine is
+feature-complete, tuned, hardened, and API-frozen as of `0.7`; `0.8` adds the one
+ergonomic the simple-API mandate still wanted — the autocommit `get`/`put`/`delete`
+lazy path — and broadens parse-path fuzzing. The only changes from here to `1.0`
+are MINOR-compatible additions and bug fixes; no signature breaks. See
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) for hot-path numbers and
+[`docs/API.md`](./docs/API.md) for the full surface. What remains before `1.0`
+is a beta/RC soak against real consumers.
 
 <hr>
 <br>

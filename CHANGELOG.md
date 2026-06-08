@@ -18,6 +18,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.0] - 2026-06-08
+
+Alpha. The autocommit convenience path and broader parse-path fuzzing — additive,
+MINOR-compatible; no existing signature changed.
+
+### Added
+
+- `Db::get`, `Db::put`, `Db::delete` — the lazy single-operation path. `get`
+  takes a snapshot and reads one key; `put` and `delete` run in their own
+  transaction and retry on conflict (last-writer-wins), so a single write needs
+  no `begin`/`commit` ceremony. Multi-step atomicity and explicit conflict
+  handling remain on `Db::begin`.
+- Parse-path fuzz-style property tests for the durable commit-record decoder:
+  arbitrary byte strings never panic or over-allocate, encode/decode round-trips
+  over arbitrary commits, and any trailing bytes are rejected.
+
+---
+
 ## [0.7.0] - 2026-06-08
 
 Hardening release, and the **public API is frozen**: it will not change before
@@ -262,7 +280,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/txn-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/txn-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/txn-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/txn-db/compare/v0.4.0...v0.5.0

@@ -385,6 +385,112 @@ impl<S: VersionStore> Db<S> {
         Snapshot::new(Arc::clone(&self.inner))
     }
 
+    /// Read one key without opening a transaction.
+    ///
+    /// A convenience for the common single-read case: it takes a snapshot of the
+    /// current state and reads `key` from it, returning the newest committed
+    /// value or `None` if the key is absent. For reading several keys at one
+    /// consistent instant, take a [`snapshot`](Db::snapshot) and reuse it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
+    /// fails the read. The default in-memory store never fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::Db;
+    ///
+    /// let db = Db::new();
+    /// db.put(b"k".to_vec(), b"v".to_vec())?;
+    /// assert_eq!(db.get(b"k")?.as_deref(), Some(&b"v"[..]));
+    /// assert_eq!(db.get(b"absent")?, None);
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    pub fn get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>> {
+        self.snapshot().get(key)
+    }
+
+    /// Write one key in its own transaction, retrying on conflict, and return the
+    /// commit timestamp.
+    ///
+    /// A convenience for the common single-write case: it begins a transaction,
+    /// buffers the write, and commits. If a concurrent transaction wins the
+    /// commit race it retries against a fresher snapshot, so this is
+    /// last-writer-wins and never surfaces a conflict — the value is always
+    /// installed. When you need to read-then-write atomically, or to control the
+    /// conflict outcome yourself, use [`begin`](Db::begin) instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
+    /// fails to apply the write, or
+    /// [`TxnError::Durability`](crate::TxnError::Durability) for a durable
+    /// database whose commit cannot be made durable. Conflicts are retried, not
+    /// returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::Db;
+    ///
+    /// let db = Db::new();
+    /// let ts = db.put(b"k".to_vec(), b"v".to_vec())?;
+    /// assert!(ts > txn_db::Timestamp::ZERO);
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    pub fn put(&self, key: impl Into<Arc<[u8]>>, value: impl Into<Arc<[u8]>>) -> Result<Timestamp> {
+        let key = key.into();
+        let value = value.into();
+        loop {
+            let mut tx = self.begin();
+            tx.put(Arc::clone(&key), Arc::clone(&value));
+            match tx.commit() {
+                Ok(ts) => return Ok(ts),
+                Err(e) if e.is_retryable() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Delete one key in its own transaction, retrying on conflict, and return
+    /// the commit timestamp.
+    ///
+    /// The delete counterpart of [`put`](Db::put): last-writer-wins, conflicts
+    /// retried. After it returns the key reads as absent until written again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
+    /// fails, or [`TxnError::Durability`](crate::TxnError::Durability) for a
+    /// durable database whose commit cannot be made durable. Conflicts are
+    /// retried, not returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use txn_db::Db;
+    ///
+    /// let db = Db::new();
+    /// db.put(b"k".to_vec(), b"v".to_vec())?;
+    /// db.delete(b"k".to_vec())?;
+    /// assert_eq!(db.get(b"k")?, None);
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    pub fn delete(&self, key: impl Into<Arc<[u8]>>) -> Result<Timestamp> {
+        let key = key.into();
+        loop {
+            let mut tx = self.begin();
+            tx.delete(Arc::clone(&key));
+            match tx.commit() {
+                Ok(ts) => return Ok(ts),
+                Err(e) if e.is_retryable() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// The timestamp of the most recent commit visible to a new transaction.
     ///
     /// Returns [`Timestamp::ZERO`] for a database that has never been written.
@@ -541,6 +647,43 @@ mod tests {
         tx.put(b"k".to_vec(), b"v".to_vec());
         tx.rollback();
         assert_eq!(db.begin().get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_autocommit_put_get_delete() {
+        let db = Db::new();
+        let ts = db.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+        assert!(ts > Timestamp::ZERO);
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(db.get(b"absent").unwrap(), None);
+
+        let ts2 = db.delete(b"k".to_vec()).unwrap();
+        assert!(ts2 > ts);
+        assert_eq!(db.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_autocommit_put_is_last_writer_wins_under_contention() {
+        use std::thread;
+        let db = Db::new();
+        let handles: Vec<_> = (0..8u8)
+            .map(|t| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        // All threads write the same hot key; autocommit retries
+                        // internally, so none of these ever fail.
+                        let _ = db.put(b"hot".to_vec(), vec![t]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // The key exists and holds one of the written values.
+        let v = db.get(b"hot").unwrap().unwrap();
+        assert!(v.len() == 1 && v[0] < 8);
     }
 
     #[test]

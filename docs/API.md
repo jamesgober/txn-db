@@ -22,7 +22,8 @@
 > durable commit log in `0.4`, and garbage collection in `0.5` — at which point
 > the engine became feature-complete; `0.6` tuned the hot path (see
 > [`PERFORMANCE.md`](./PERFORMANCE.md)) and `0.7` hardened it and froze the public
-> surface documented here. The API below will not change before `2.0`.
+> surface. `0.8` adds the autocommit `Db::get`/`put`/`delete` convenience (an
+> additive, MINOR-compatible change). No existing signature changes before `2.0`.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -68,7 +69,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.7"
+txn-db = "0.8"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.
@@ -154,9 +155,17 @@ written `Db` with no generics in the common case.
 | `begin` | `fn begin(&self) -> Transaction<S>` | Start a snapshot-isolation transaction over the current snapshot. |
 | `begin_serializable` | `fn begin_serializable(&self) -> Transaction<S>` | Start a serializable transaction (read set validated at commit). Requires the `serializable` feature. |
 | `snapshot` | `fn snapshot(&self) -> Snapshot<S>` | Take a read-only, point-in-time view. |
+| `get` | `fn get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>>` | Autocommit read of one key (takes a snapshot and reads it). |
+| `put` | `fn put(&self, key, value) -> Result<Timestamp>` | Autocommit write of one key, retrying on conflict (last-writer-wins). |
+| `delete` | `fn delete(&self, key) -> Result<Timestamp>` | Autocommit delete of one key, retrying on conflict. |
 | `last_committed` | `fn last_committed(&self) -> Timestamp` | The timestamp of the most recent commit; `Timestamp::ZERO` if none. |
 | `collect_garbage` | `fn collect_garbage(&self) -> usize` | Reclaim versions no live transaction or snapshot can observe; returns the count removed. |
 | `clone` | `fn clone(&self) -> Self` | A new handle to the same database. |
+
+The autocommit `get` / `put` / `delete` are the lazy single-operation path: each
+runs in its own transaction. `put` and `delete` retry internally on conflict, so
+they are last-writer-wins and never return a conflict — for read-then-write
+atomicity or explicit conflict handling, use [`begin`](#db).
 
 `begin`, `begin_serializable`, and `snapshot` all capture the current commit
 high-water mark as their read timestamp. Commits made after that moment are

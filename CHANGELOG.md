@@ -18,6 +18,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.0] - 2026-06-08
+
+Beta. Final benchmarks captured; no behavior or API change.
+
+### Added
+
+- `benches/comparison.rs` and a `Comparison` section in `docs/PERFORMANCE.md`: an
+  honest head-to-head against a single `RwLock<HashMap>` — the alternative a
+  developer reaches for without MVCC. txn-db wins single-thread point reads
+  (zero-copy `Arc` returns) and sustains roughly 3× the read throughput under a
+  concurrent writer (snapshot reads never block on the writer); it costs several
+  times more per write, the price of full transaction machinery, recorded plainly.
+
+---
+
 ## [0.8.0] - 2026-06-08
 
 Alpha. The autocommit convenience path and broader parse-path fuzzing — additive,
@@ -280,7 +295,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/txn-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/txn-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/txn-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/txn-db/compare/v0.5.0...v0.6.0

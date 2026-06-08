@@ -59,10 +59,10 @@ Available now (`0.5`, feature-complete):
 
 ```toml
 [dependencies]
-txn-db = "0.8"
+txn-db = "0.9"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "0.8", features = ["serializable", "durability"] }
+txn-db = { version = "0.9", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -246,14 +246,14 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is the `0.8` release — the alpha in the run to `1.0`. The engine is
-feature-complete, tuned, hardened, and API-frozen as of `0.7`; `0.8` adds the one
-ergonomic the simple-API mandate still wanted — the autocommit `get`/`put`/`delete`
-lazy path — and broadens parse-path fuzzing. The only changes from here to `1.0`
-are MINOR-compatible additions and bug fixes; no signature breaks. See
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) for hot-path numbers and
-[`docs/API.md`](./docs/API.md) for the full surface. What remains before `1.0`
-is a beta/RC soak against real consumers.
+This is the `0.9` release — the beta in the run to `1.0`. The engine is
+feature-complete, tuned, hardened, and API-frozen; `0.9` captures the final
+benchmarks, including an honest head-to-head against the naive
+`RwLock<HashMap>` alternative (txn-db wins single-thread reads and ~3× concurrent
+reads-under-writer; it costs more per write — the price of transactions, called
+out plainly in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)). See
+[`docs/API.md`](./docs/API.md) for the full surface. From here to `1.0` it is
+bug-fix and doc polish only — a soak, not new features.
 
 <hr>
 <br>

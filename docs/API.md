@@ -69,7 +69,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "0.8"
+txn-db = "0.9"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.

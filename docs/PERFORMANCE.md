@@ -80,6 +80,46 @@ commit watermark) serialize. The contended workload degrades with writer count b
 design — a single hot key cannot be committed in parallel, and added writers only
 add retries.
 
+## Comparison: txn-db vs a single `RwLock<HashMap>`
+
+`txn-db` is a transaction layer, not a full storage engine, so the fair
+comparison is not against `sled` or `redb` but against the obvious hand-rolled
+alternative: one reader-writer lock over a `HashMap`. The
+[`comparison`](../benches/comparison.rs) benchmark runs both over the same
+10,000-key set. The numbers are recorded honestly — txn-db wins two of the three
+and loses the third, and the loss is called out rather than buried.
+
+| Workload | `RwLock<HashMap>` | `txn-db` | |
+|----------|------------------:|---------:|---|
+| Point read, single thread | ~33 ns | **~26 ns** | txn-db: a snapshot read returns an `Arc` (no value copy); the baseline clones the `Vec`. |
+| Write, single thread | **~65 ns** | ~370 ns | baseline: a bare lock-and-insert. txn-db pays for a full transaction — snapshot, conflict check, versioned apply, watermark. |
+| Reads under a continuous writer, 2 readers | 4.7 M/s | **17 M/s** | |
+| &nbsp;&nbsp;… 8 readers | 15 M/s | **41 M/s** | |
+| &nbsp;&nbsp;… 32 readers | 19 M/s | **65 M/s** | |
+
+Reading the table:
+
+- **Reads are cheaper** in txn-db, single-threaded, because a snapshot read hands
+  back a reference-counted `Arc<[u8]>` while the lock-over-map must clone the
+  value out from under the lock.
+- **Writes are several times more expensive** — the honest cost of MVCC. A
+  `RwLock<HashMap>` write is one lock acquisition and one insert; a txn-db commit
+  takes a snapshot, allocates a commit timestamp, validates for conflicts,
+  installs a new version, and advances the read watermark. That machinery is what
+  buys snapshot isolation, conflict detection, and durability — none of which the
+  bare map has.
+- **Concurrent reads scale where the single lock cannot.** With one writer
+  committing continuously, txn-db sustains roughly **3× the read throughput**: a
+  snapshot read never waits for a writer, whereas every reader on the
+  `RwLock` baseline blocks whenever the writer holds the exclusive lock. This is
+  the whole point of multi-version concurrency control, and it is the workload —
+  read-mostly with concurrent writes — where the write overhead pays for itself.
+
+If a workload is single-threaded and write-heavy with no need for transactions,
+the bare `RwLock<HashMap>` is the right tool and txn-db is the wrong one. The
+moment you need snapshot isolation, conflict detection, or concurrent readers
+that do not stall behind writers, the trade inverts.
+
 ## Optimization log
 
 ### v0.6.0 — single-write commit fast path

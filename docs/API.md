@@ -411,9 +411,9 @@ pub enum TxnError {
 ```
 
 The crate error type. It implements `std::error::Error`, `Display`, `Clone`,
-`PartialEq`, and `error_forge::ForgeError` (so `kind` / `caption` / `is_fatal`
-metadata is available to portfolio tooling). It is `#[non_exhaustive]`: a
-`match` over it must include a wildcard arm.
+`PartialEq`, and `error_forge::ForgeError` (so `kind` / `caption` /
+`is_retryable` / `is_fatal` metadata is available to portfolio tooling). It is
+`#[non_exhaustive]`: a `match` over it must include a wildcard arm.
 
 #### Variants
 

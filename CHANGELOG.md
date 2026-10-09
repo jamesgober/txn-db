@@ -18,6 +18,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.0.1] - 2026-10-08
+
+Patch release. Fixes `TxnError`'s `error-forge` retry metadata; no API change.
+
+### Fixed
+
+- `<TxnError as ForgeError>::is_retryable` returned `false` for every variant,
+  including `Conflict`. The `ForgeError` impl did not override the trait's
+  `is_retryable`, so the trait default (`false`) applied, while the inherent
+  `TxnError::is_retryable` returned `true` for `Conflict`. Code that handled the
+  error as a `&dyn ForgeError` or `Box<dyn ForgeError>`, or through
+  `error-forge`'s generic retry and recovery helpers, never retried a
+  transaction conflict. The trait method now delegates to the inherent method,
+  so both report the same answer: `Conflict` is retryable, `Store` and
+  `Durability` are not. `is_fatal` was already correct (`true` only for
+  `Durability`) and is unchanged.
+
+### Added
+
+- Tests that call `is_retryable`, `is_fatal` and `kind` through
+  `<TxnError as ForgeError>` and through `&dyn ForgeError` for every variant,
+  plus one that boxes a real commit conflict as `Box<dyn ForgeError>`. The
+  variant list is checked by an exhaustive `match`, so a new variant cannot be
+  added without being covered.
+
+---
+
 ## [1.0.0] - 2026-06-08
 
 First stable release. The public API is frozen until 2.0 and the durable
@@ -326,7 +353,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jamesgober/txn-db/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/txn-db/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/txn-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/txn-db/compare/v0.7.0...v0.8.0

@@ -3,7 +3,7 @@
 //! Every fallible operation in `txn-db` returns [`Result<T>`], whose error is
 //! [`TxnError`]. The type integrates with the portfolio's `error-forge`
 //! framework — it implements [`error_forge::ForgeError`], so callers get the
-//! stable `kind` / `is_fatal` metadata other crates rely on.
+//! stable `kind` / `is_retryable` / `is_fatal` metadata other crates rely on.
 //!
 //! The error a caller meets most often is [`TxnError::Conflict`]: under
 //! snapshot isolation, two transactions that wrote the same key race at commit
@@ -203,6 +203,16 @@ impl ForgeError for TxnError {
         "transaction error"
     }
 
+    /// Delegates to the inherent [`TxnError::is_retryable`], so code that holds
+    /// the error as a `ForgeError` (a `&dyn ForgeError`, or `error-forge`'s
+    /// generic retry helpers) gets the same answer as code calling the inherent
+    /// method: a [`Conflict`](TxnError::Conflict) is retryable, nothing else is.
+    fn is_retryable(&self) -> bool {
+        // Inherent methods take precedence in path resolution, so this calls
+        // the inherent `is_retryable`, not this trait method.
+        TxnError::is_retryable(self)
+    }
+
     /// A [`Conflict`](TxnError::Conflict) is the retry signal and a
     /// [`Store`](TxnError::Store) failure is the store's to classify, so neither
     /// is fatal. A [`Durability`](TxnError::Durability) failure puts the crash
@@ -250,5 +260,81 @@ mod tests {
     fn test_error_is_clonable_and_comparable() {
         let a = TxnError::conflict(4);
         assert_eq!(a.clone(), a);
+    }
+
+    /// One value of every variant, paired with whether it is retryable and
+    /// whether it is fatal. The `match` has no wildcard arm, so adding a
+    /// variant fails to compile here until the new variant is listed.
+    fn every_variant() -> Vec<(TxnError, bool, bool)> {
+        let cases = vec![
+            (TxnError::conflict(8), true, false),
+            (TxnError::store("read", "disk gone"), false, false),
+            (
+                TxnError::Durability {
+                    detail: "sync failed".to_string(),
+                },
+                false,
+                true,
+            ),
+        ];
+        for (err, _, _) in &cases {
+            match err {
+                TxnError::Conflict { .. }
+                | TxnError::Store { .. }
+                | TxnError::Durability { .. } => {}
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn test_trait_is_retryable_matches_inherent_for_every_variant() {
+        for (err, retryable, _) in every_variant() {
+            assert_eq!(TxnError::is_retryable(&err), retryable, "{err:?}");
+            assert_eq!(
+                <TxnError as ForgeError>::is_retryable(&err),
+                retryable,
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dyn_forge_error_is_retryable_for_every_variant() {
+        for (err, retryable, _) in every_variant() {
+            let dyn_err: &dyn ForgeError = &err;
+            assert_eq!(dyn_err.is_retryable(), retryable, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_fatal_for_every_variant() {
+        for (err, _, fatal) in every_variant() {
+            assert_eq!(<TxnError as ForgeError>::is_fatal(&err), fatal, "{err:?}");
+            let dyn_err: &dyn ForgeError = &err;
+            assert_eq!(dyn_err.is_fatal(), fatal, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn test_kind_through_dyn_forge_error_for_every_variant() {
+        for (err, _, _) in every_variant() {
+            let dyn_err: &dyn ForgeError = &err;
+            assert_eq!(dyn_err.kind(), err.kind());
+            assert_eq!(dyn_err.caption(), "transaction error");
+        }
+    }
+
+    #[test]
+    fn test_boxed_dyn_forge_error_from_real_conflict_is_retryable() {
+        let db = crate::Db::new();
+        let mut a = db.begin();
+        let mut b = db.begin();
+        a.put(b"k".to_vec(), b"a".to_vec());
+        b.put(b"k".to_vec(), b"b".to_vec());
+        let _ = a.commit().unwrap();
+        let boxed: Box<dyn ForgeError> = Box::new(b.commit().unwrap_err());
+        assert!(boxed.is_retryable());
+        assert!(!boxed.is_fatal());
     }
 }

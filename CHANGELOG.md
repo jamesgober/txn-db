@@ -211,7 +211,7 @@ the durable path all pass.
 
 ### Changed
 
-- **Public API frozen** (recorded in `.dev/ROADMAP.md`). No further API changes
+- **Public API frozen**. No further API changes
   before 2.0; remaining pre-1.0 work is a beta/RC soak.
 
 ### Notes
@@ -432,7 +432,6 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `REPS.md` compliance baseline at the repository root.
 - `.github/workflows/ci.yml` &mdash; Linux/macOS/Windows CI matrix on stable and MSRV, plus loom and audit/deny jobs.
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
 [Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/jamesgober/txn-db/compare/v1.0.1...v1.1.0

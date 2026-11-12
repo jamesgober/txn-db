@@ -266,7 +266,6 @@ numbers.
 
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; durable transaction commit log
 - [`lsm-db`](https://github.com/jamesgober/lsm-db) &mdash; a natural backing version store
-- Hive DB &mdash; the transaction orchestration layer (DISTRO) builds on these semantics
 
 It stays foreign-compatible: usable standalone over any version store that implements the trait.
 

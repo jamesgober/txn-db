@@ -64,17 +64,27 @@
 //!
 //! - **Tier 1** is the whole common case: [`Db::new`], [`Db::begin`], and the
 //!   [`Transaction`] methods. No builder, no generics to name.
-//! - **Tier 2** is configuration through a builder, arriving in a later phase.
+//! - **Tier 2**, configuration through a builder, does not exist yet. The
+//!   durable database (`Db::open`, `durability` feature) uses fixed settings,
+//!   including a 64 MiB limit on one commit's log record.
 //! - **Tier 3** is the [`VersionStore`] trait, the seam for custom backends,
 //!   reachable through [`Db::with_store`].
 //!
+//! ## Features
+//!
+//! - `serializable`: `Db::begin_serializable`, optimistic read-set
+//!   validation that rejects write skew and the read-only anomaly among
+//!   serializable transactions.
+//! - `durability`: `Db::open`, a durable commit log on `wal-db`, replayed on
+//!   open. A commit's writes become visible only after its record is synced.
+//!
+//! Garbage collection of old versions ([`Db::collect_garbage`]) is always
+//! available.
+//!
 //! ## Status
 //!
-//! This is the `0.2` foundation: the public surface, the MVCC core, snapshot
-//! isolation, and write-write conflict detection over an in-memory store.
-//! Serializable isolation, a durable commit log via `wal-db`, and version
-//! garbage collection follow in later phases. The shape of the Tier-1 API is
-//! settled and will not change before `1.0`.
+//! Stable. The public API is frozen until `2.0` and the durable commit-log
+//! format is frozen for the `1.x` series.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(warnings)]

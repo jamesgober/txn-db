@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use wal_db::Wal;
+use wal_db::{Wal, WalConfig};
 
 use crate::error::{Result, TxnError};
 use crate::store::WriteEntry;
@@ -46,9 +46,17 @@ pub(crate) struct RecoveredCommit {
     pub(crate) writes: Vec<WriteEntry>,
 }
 
+/// The largest encoded commit record the log accepts, in bytes: `wal-db`'s
+/// default record limit of 64 MiB. A commit whose record would be larger is
+/// refused with [`TxnError::TooLarge`] before anything is applied or logged.
+pub(crate) const MAX_RECORD_BYTES: usize = WalConfig::new().max_record_size() as usize;
+
 /// A `wal-db` log of committed transactions.
 pub(crate) struct CommitLog {
     wal: Wal,
+    /// Test hook: when set, the next append fails as if the disk were full.
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 impl CommitLog {
@@ -57,13 +65,27 @@ impl CommitLog {
     /// Returns the open log and the recovered commits in log order. The caller
     /// orders them by commit timestamp before installing them.
     pub(crate) fn open(path: impl AsRef<std::path::Path>) -> Result<(Self, Vec<RecoveredCommit>)> {
-        let wal = Wal::open(path).map_err(TxnError::durability)?;
+        let wal = Wal::open_with(path, WalConfig::new()).map_err(TxnError::durability)?;
         let mut recovered = Vec::new();
         for entry in wal.iter().map_err(TxnError::durability)? {
             let entry = entry.map_err(TxnError::durability)?;
             recovered.push(decode_commit(entry.data())?);
         }
-        Ok((CommitLog { wal }, recovered))
+        Ok((
+            CommitLog {
+                wal,
+                #[cfg(test)]
+                fail_next_append: std::sync::atomic::AtomicBool::new(false),
+            },
+            recovered,
+        ))
+    }
+
+    /// Make the next append fail, for tests of the failure path.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_next_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Append an already-encoded commit record and make it durable before
@@ -74,6 +96,13 @@ impl CommitLog {
     /// The record is encoded by [`encode_for_log`] before the write set is moved
     /// into the version store.
     pub(crate) fn append_committed(&self, record: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_append
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TxnError::durability("injected append failure"));
+        }
         self.wal
             .append_and_sync(record)
             .map(|_lsn| ())
@@ -90,14 +119,28 @@ const RECORD_VERSION: u8 = 1;
 /// (`key_len` u32 + `tag` u8). Used to bound the write count before allocating.
 const MIN_WRITE_BYTES: usize = 4 + 1;
 
+/// Bytes of the fixed record header: version, commit timestamp, write count.
+const HEADER_BYTES: usize = 1 + 8 + 4;
+
+/// The exact length of the record [`encode_for_log`] produces for `writes`,
+/// computed without encoding. Saturates rather than overflowing, so an absurd
+/// write set still compares as too large.
+pub(crate) fn encoded_len(writes: &[WriteEntry]) -> usize {
+    writes.iter().fold(HEADER_BYTES, |total, (key, value)| {
+        let entry = (4 + 1usize)
+            .saturating_add(key.len())
+            .saturating_add(value.as_ref().map_or(0, |v| 4usize.saturating_add(v.len())));
+        total.saturating_add(entry)
+    })
+}
+
 /// Encode one committed transaction into a record, ready for
 /// [`CommitLog::append_committed`].
+///
+/// The caller checks [`encoded_len`] against [`MAX_RECORD_BYTES`] first, so
+/// every length written here fits in its `u32` field.
 pub(crate) fn encode_for_log(commit_ts: Timestamp, writes: &[WriteEntry]) -> Vec<u8> {
-    let body: usize = writes
-        .iter()
-        .map(|(key, value)| 4 + key.len() + 1 + value.as_ref().map_or(0, |v| 4 + v.len()))
-        .sum();
-    let mut buf = Vec::with_capacity(1 + 8 + 4 + body);
+    let mut buf = Vec::with_capacity(encoded_len(writes));
     buf.push(RECORD_VERSION);
     buf.extend_from_slice(&commit_ts.get().to_le_bytes());
     buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
@@ -114,6 +157,17 @@ pub(crate) fn encode_for_log(commit_ts: Timestamp, writes: &[WriteEntry]) -> Vec
         }
     }
     buf
+}
+
+/// Overwrite the commit timestamp of a record produced by [`encode_for_log`].
+///
+/// A commit's timestamp is taken while the store holds its locks, after the
+/// write set has been handed to the store, so the record is encoded first with
+/// a placeholder and stamped here. The record layout is unchanged.
+pub(crate) fn set_commit_ts(record: &mut [u8], commit_ts: Timestamp) {
+    if let Some(field) = record.get_mut(1..9) {
+        field.copy_from_slice(&commit_ts.get().to_le_bytes());
+    }
 }
 
 /// Decode one record, validating the version and every length against the bytes
@@ -274,6 +328,36 @@ mod tests {
         let decoded = decode_commit(&bytes).unwrap();
         assert_eq!(decoded.commit_ts, Timestamp::from_raw(42));
         assert_eq!(decoded.writes, writes);
+    }
+
+    #[test]
+    fn test_encoded_len_matches_encoding() {
+        let writes = vec![
+            entry(b"alice", Some(b"100")),
+            entry(b"bob", None),
+            entry(b"", Some(b"")),
+        ];
+        assert_eq!(
+            encoded_len(&writes),
+            encode_for_log(Timestamp::from_raw(1), &writes).len()
+        );
+        assert_eq!(encoded_len(&[]), HEADER_BYTES);
+    }
+
+    #[test]
+    fn test_set_commit_ts_restamps_record() {
+        let writes = vec![entry(b"k", Some(b"v"))];
+        let mut bytes = encode_for_log(Timestamp::ZERO, &writes);
+        set_commit_ts(&mut bytes, Timestamp::from_raw(99));
+        let decoded = decode_commit(&bytes).unwrap();
+        assert_eq!(decoded.commit_ts, Timestamp::from_raw(99));
+        assert_eq!(decoded.writes, writes);
+        assert_eq!(bytes, encode_for_log(Timestamp::from_raw(99), &writes));
+    }
+
+    #[test]
+    fn test_max_record_bytes_is_wal_db_default() {
+        assert_eq!(MAX_RECORD_BYTES, 64 * 1024 * 1024);
     }
 
     #[test]

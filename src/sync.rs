@@ -2,7 +2,8 @@
 //! `--cfg loom`.
 //!
 //! The commit path uses an atomic counter, a set of sharded reader-writer locks,
-//! and a small mutex for the read-timestamp watermark. To let `loom` explore
+//! a small mutex and condition variable for the read-timestamp watermark, and a
+//! set of sharded mutexes for the live-reader registry. To let `loom` explore
 //! every interleaving of those operations, the whole crate imports its sync
 //! types from here rather than from `std::sync` directly. Under a normal build
 //! these are exactly the standard-library types; under `--cfg loom` they are
@@ -11,12 +12,12 @@
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(loom)]
-pub(crate) use loom::sync::{Mutex, RwLock};
+pub(crate) use loom::sync::{Condvar, Mutex, RwLock};
 
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
-pub(crate) use std::sync::{Mutex, RwLock};
+pub(crate) use std::sync::{Condvar, Mutex, RwLock};
 
 /// Lock a [`Mutex`], recovering the guard if a previous holder panicked.
 ///
@@ -28,6 +29,17 @@ pub(crate) use std::sync::{Mutex, RwLock};
 #[inline]
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Block on a [`Condvar`] until notified, recovering the guard if a previous
+/// holder of the mutex panicked. Spurious wake-ups are possible, so callers
+/// re-check their condition in a loop.
+#[inline]
+pub(crate) fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    match cv.wait(guard) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }

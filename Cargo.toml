@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "txn-db"
-version = "1.0.1"
+version = "1.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -69,10 +69,11 @@ std = []
 # synced before the commit is acknowledged, and `Db::open` replays the log on
 # startup. Additive — the in-memory `Db::new` path is unchanged when this is off.
 durability = ["dep:wal-db"]
-# Serializable isolation (SSI) on top of snapshot isolation: adds
-# `Db::begin_serializable`, which validates a transaction's read set at commit so
-# that write skew and other snapshot-isolation anomalies are rejected. Additive
-# — snapshot isolation is unchanged and remains the default when this is off.
+# Serializable isolation on top of snapshot isolation: adds
+# `Db::begin_serializable`, which validates a transaction's read set at commit
+# (optimistic backward validation) so that write skew and the read-only anomaly
+# are rejected. Additive: snapshot isolation is unchanged and remains the
+# default when this is off.
 serializable = []
 
 

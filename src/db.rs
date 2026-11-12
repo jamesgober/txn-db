@@ -9,9 +9,11 @@
 //! the [`Oracle`](crate::oracle::Oracle) that allocates timestamps and tracks
 //! the read watermark. Commit coordination is split deliberately: the oracle
 //! hands out timestamps lock-free, and the version store is the serialization
-//! point that validates and applies each commit atomically. The single global
-//! commit lock of the foundation release is gone.
+//! point that validates and applies each commit atomically, taking the commit's
+//! timestamp while it holds the commit's locks so that overlapping commits apply
+//! in timestamp order.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -19,6 +21,14 @@ use crate::oracle::Oracle;
 use crate::store::{MemoryStore, VersionStore, WriteEntry};
 use crate::timestamp::Timestamp;
 use crate::txn::{Snapshot, Transaction};
+
+/// How many times [`Db::put`] and [`Db::delete`] attempt a commit before they
+/// give up and return the conflict. Each retry first waits until every commit
+/// that had taken a timestamp when the conflict was seen is visible, so the next
+/// attempt reads past the version it lost to. Reaching the bound therefore takes
+/// this many other commits winning the same key during one call, or a store
+/// that reports conflicts that do not exist.
+const AUTOCOMMIT_ATTEMPTS: u32 = 10_000;
 
 /// Shared, reference-counted state for one logical database.
 ///
@@ -35,7 +45,71 @@ pub(crate) struct Inner<S: VersionStore> {
     /// The durable commit log, present only for a database opened with
     /// [`Db::open`]. `None` for an in-memory database.
     #[cfg(feature = "durability")]
-    log: Option<crate::durable::CommitLog>,
+    log: Option<DurableLog<S>>,
+}
+
+/// The durable commit log of a database opened with [`Db::open`], with what the
+/// commit path needs to keep it consistent with memory.
+#[cfg(feature = "durability")]
+struct DurableLog<S> {
+    log: crate::durable::CommitLog,
+    /// Removes the versions a commit applied, for a commit whose append failed.
+    undo: fn(&S, Timestamp, &[Arc<[u8]>]),
+    /// Set by the first append or sync failure. The log file's state is in doubt
+    /// from then on, so every later commit is refused until the database is
+    /// reopened.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+/// A commit's timestamp, taken at most once and always released.
+///
+/// The store calls [`get`](Stamp::get) while it holds the commit's locks; later
+/// calls return the same timestamp. Dropping the stamp reports an allocated
+/// timestamp to the oracle, so the watermark moves past it on every path out
+/// of the commit: success, conflict, log failure, or a panic unwinding out of
+/// the store.
+struct Stamp<'a> {
+    oracle: &'a Oracle,
+    ts: Cell<Option<Timestamp>>,
+}
+
+impl<'a> Stamp<'a> {
+    fn new(oracle: &'a Oracle) -> Self {
+        Stamp {
+            oracle,
+            ts: Cell::new(None),
+        }
+    }
+
+    fn get(&self) -> Timestamp {
+        if let Some(ts) = self.ts.get() {
+            return ts;
+        }
+        let ts = self.oracle.alloc_commit_ts();
+        self.ts.set(Some(ts));
+        ts
+    }
+}
+
+impl Drop for Stamp<'_> {
+    fn drop(&mut self) {
+        if let Some(ts) = self.ts.get() {
+            self.oracle.commit_done(ts);
+        }
+    }
+}
+
+/// A single registered point read, unregistered on drop (also on unwind).
+struct PointRead<'a, S: VersionStore> {
+    inner: &'a Inner<S>,
+    read_ts: Timestamp,
+    slot: usize,
+}
+
+impl<S: VersionStore> Drop for PointRead<'_, S> {
+    fn drop(&mut self) {
+        self.inner.end_reader(self.read_ts, self.slot);
+    }
 }
 
 impl<S: VersionStore> Inner<S> {
@@ -54,16 +128,16 @@ impl<S: VersionStore> Inner<S> {
         self.oracle.read_ts()
     }
 
-    /// Register a live reader and return its read timestamp.
+    /// Register a live reader and return its read timestamp and registry slot.
     #[inline]
-    pub(crate) fn begin_reader(&self) -> Timestamp {
+    pub(crate) fn begin_reader(&self) -> (Timestamp, usize) {
         self.oracle.begin_reader()
     }
 
-    /// Unregister a reader that began at `read_ts`.
+    /// Unregister a reader that began at `read_ts` in `slot`.
     #[inline]
-    pub(crate) fn end_reader(&self, read_ts: Timestamp) {
-        self.oracle.end_reader(read_ts);
+    pub(crate) fn end_reader(&self, read_ts: Timestamp, slot: usize) {
+        self.oracle.end_reader(read_ts, slot);
     }
 
     /// Reclaim versions no live reader can observe, returning the count removed.
@@ -71,57 +145,152 @@ impl<S: VersionStore> Inner<S> {
         self.store.collect_garbage(self.oracle.low_watermark())
     }
 
-    /// Allocate a commit timestamp, validate-and-apply through the store, then
-    /// release the timestamp into the watermark.
+    /// Read one key at the current watermark, registered as a reader for the
+    /// duration of the read only.
+    fn point_get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>> {
+        let (read_ts, slot) = self.begin_reader();
+        let read = PointRead {
+            inner: self,
+            read_ts,
+            slot,
+        };
+        self.store.get(key, read.read_ts)
+    }
+
+    /// Validate and apply a commit through the store, make it durable when the
+    /// database has a log, release its timestamp into the watermark, and wait
+    /// until it is visible.
     ///
-    /// The timestamp is reported to the oracle on both outcomes — a successful
-    /// commit and a rejected one — so a conflict never stalls the read watermark
-    /// behind the timestamp it consumed.
+    /// The store takes the commit timestamp while it holds the commit's locks
+    /// ([`VersionStore::try_commit_ordered`]), so commits that touch
+    /// overlapping keys apply in timestamp order. The timestamp is released on
+    /// every outcome, including a store panic, so a failed attempt never stalls
+    /// the watermark behind it.
     pub(crate) fn commit_writes(
         &self,
         read_ts: Timestamp,
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
     ) -> Result<Timestamp> {
-        let commit_ts = self.oracle.alloc_commit_ts();
-
-        // Encode the durable record before the write set is consumed by the
-        // store. No cost for an in-memory database (no log).
+        // Check the log's state and the record size, and encode the record,
+        // before the write set is consumed by the store. No cost for an
+        // in-memory database (no log).
         #[cfg(feature = "durability")]
-        let record = self
-            .log
-            .as_ref()
-            .map(|_| crate::durable::encode_for_log(commit_ts, &writes));
+        let prepared = match self.log.as_ref() {
+            Some(durable) => Some(durable.prepare(&writes)?),
+            None => None,
+        };
 
-        let outcome = self.store.try_commit(read_ts, commit_ts, writes, reads);
+        let stamp = Stamp::new(&self.oracle);
+        let _applied_at = self
+            .store
+            .try_commit_ordered(read_ts, writes, reads, &|| stamp.get())?;
+        // The stamp is the authority on the timestamp, whatever the store
+        // returned, so the oracle's bookkeeping cannot be confused by it.
+        let commit_ts = stamp.get();
 
-        // Make the commit durable before it is acknowledged. The validate-and-
-        // apply has already happened in memory but is not yet visible — the
-        // watermark only advances at `commit_done` below — so a crash before the
-        // sync completes leaves a transaction that was never acknowledged and is
-        // recovered as absent.
+        // Make the commit durable before it becomes visible. The writes are
+        // applied but hidden: the watermark cannot pass `commit_ts` until the
+        // stamp is dropped. If the append fails, the writes are removed before
+        // that, so no reader ever sees them.
+        // The undo guard is declared after the stamp, so on an error return or
+        // a panic it runs first and the writes are gone before the timestamp
+        // is released.
         #[cfg(feature = "durability")]
-        if outcome.is_ok() {
-            if let (Some(log), Some(record)) = (self.log.as_ref(), record) {
-                if let Err(err) = log.append_committed(&record) {
-                    self.oracle.commit_done(commit_ts);
-                    return Err(err);
-                }
-            }
+        if let (Some(durable), Some((mut record, keys))) = (self.log.as_ref(), prepared) {
+            crate::durable::set_commit_ts(&mut record, commit_ts);
+            let mut undo = UndoUnlessLogged {
+                durable,
+                store: &self.store,
+                commit_ts,
+                keys,
+                logged: false,
+            };
+            durable.log.append_committed(&record)?;
+            undo.logged = true;
         }
 
-        self.oracle.commit_done(commit_ts);
-        outcome.map(|()| commit_ts)
+        drop(stamp);
+        self.oracle.wait_visible(commit_ts);
+        Ok(commit_ts)
     }
 
     /// Build the shared inner state for a database recovered from a durable log.
     #[cfg(feature = "durability")]
-    fn recovered(store: S, oracle: Oracle, log: crate::durable::CommitLog) -> Self {
+    fn recovered(
+        store: S,
+        oracle: Oracle,
+        log: crate::durable::CommitLog,
+        undo: fn(&S, Timestamp, &[Arc<[u8]>]),
+    ) -> Self {
         Inner {
             store,
             oracle,
-            log: Some(log),
+            log: Some(DurableLog {
+                log,
+                undo,
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
+    }
+
+    /// The durable log, for tests of its failure path.
+    #[cfg(all(test, feature = "durability"))]
+    fn durable_log(&self) -> Option<&crate::durable::CommitLog> {
+        self.log.as_ref().map(|durable| &durable.log)
+    }
+}
+
+/// An encoded commit record awaiting its timestamp, with the keys it writes.
+#[cfg(feature = "durability")]
+type PreparedRecord = (Vec<u8>, Vec<Arc<[u8]>>);
+
+/// Removes a durable commit's applied writes and fails the log, unless the
+/// commit's record was appended and synced. Runs on an append error and on a
+/// panic alike.
+#[cfg(feature = "durability")]
+struct UndoUnlessLogged<'a, S> {
+    durable: &'a DurableLog<S>,
+    store: &'a S,
+    commit_ts: Timestamp,
+    keys: Vec<Arc<[u8]>>,
+    logged: bool,
+}
+
+#[cfg(feature = "durability")]
+impl<S> Drop for UndoUnlessLogged<'_, S> {
+    fn drop(&mut self) {
+        if !self.logged {
+            self.durable
+                .failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            (self.durable.undo)(self.store, self.commit_ts, &self.keys);
+        }
+    }
+}
+
+#[cfg(feature = "durability")]
+impl<S> DurableLog<S> {
+    /// Refuse the commit if the log has failed or its record would be too
+    /// large; otherwise encode the record (with a placeholder timestamp) and
+    /// collect the written keys for a possible undo.
+    fn prepare(&self, writes: &[WriteEntry]) -> Result<PreparedRecord> {
+        use crate::durable::{MAX_RECORD_BYTES, encode_for_log, encoded_len};
+        use crate::error::TxnError;
+
+        if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TxnError::durability(
+                "an earlier commit-log failure left the log in doubt; \
+                 commits are refused until the database is reopened",
+            ));
+        }
+        let len = encoded_len(writes);
+        if len > MAX_RECORD_BYTES {
+            return Err(TxnError::too_large(len, MAX_RECORD_BYTES));
+        }
+        let record = encode_for_log(Timestamp::ZERO, writes);
+        let keys = writes.iter().map(|(key, _)| Arc::clone(key)).collect();
+        Ok((record, keys))
     }
 }
 
@@ -135,8 +304,8 @@ impl<S: VersionStore> Inner<S> {
 ///
 /// Transactions default to **snapshot isolation**. With the `serializable`
 /// feature enabled, `begin_serializable` starts a transaction whose read set is
-/// validated at commit, rejecting write skew and the other anomalies snapshot
-/// isolation permits.
+/// validated at commit, rejecting write skew and the read-only anomaly that
+/// snapshot isolation permits.
 ///
 /// A `Db` is a clonable handle over shared state, like an [`Arc`]. Cloning it
 /// is cheap and every clone refers to the same database, so the idiomatic way
@@ -211,11 +380,27 @@ impl Db<MemoryStore> {
     ///
     /// Every transaction committed against the returned database appends its
     /// record to the log and syncs it before [`commit`](crate::Transaction::commit)
-    /// returns, so an acknowledged commit survives a crash. On open, the log is
-    /// replayed: each committed transaction is reinstated, and a transaction that
-    /// never reached the log — because it aborted, or because the process crashed
-    /// before its record was made durable — is simply absent. The recovered data
-    /// lives in memory; the log is the durable record from which it is rebuilt.
+    /// returns, and before any reader can see its writes, so an acknowledged
+    /// commit survives a crash and nothing a reader saw can be lost by one. On
+    /// open, the log is replayed: each committed transaction is reinstated, and a
+    /// transaction that never reached the log (because it aborted, or because
+    /// the process crashed before its record was made durable) is simply
+    /// absent. The recovered data lives in memory; the log is the durable record
+    /// from which it is rebuilt. Old versions are collected once after replay,
+    /// so the recovered store holds the current value of each key, not its
+    /// history.
+    ///
+    /// The log is never truncated: it grows by one record per commit, and
+    /// opening it replays every record, so open time grows with the number of
+    /// commits ever made.
+    ///
+    /// One commit's record must fit in 64 MiB, the `wal-db` default record
+    /// limit. A larger commit is refused with
+    /// [`TxnError::TooLarge`](crate::TxnError::TooLarge) before anything is
+    /// applied or logged. If appending or syncing a record fails, the commit
+    /// returns [`TxnError::Durability`](crate::TxnError::Durability), its writes
+    /// are removed before any reader can see them, and the database refuses
+    /// every later commit until it is reopened.
     ///
     /// Available with the `durability` feature.
     ///
@@ -262,9 +447,18 @@ impl Db<MemoryStore> {
             highest = highest.max(commit.commit_ts);
             store.install_recovered(commit.commit_ts, commit.writes);
         }
+        // No reader exists yet, so only the newest version of each key can ever
+        // be read: drop the replayed history now rather than holding all of it
+        // until the caller's first collection.
+        let _ = store.collect_garbage(highest);
 
         Ok(Db {
-            inner: Arc::new(Inner::recovered(store, Oracle::recovered(highest), log)),
+            inner: Arc::new(Inner::recovered(
+                store,
+                Oracle::recovered(highest),
+                log,
+                MemoryStore::remove_versions,
+            )),
         })
     }
 }
@@ -303,7 +497,8 @@ impl<S: VersionStore> Db<S> {
     /// Begin a snapshot-isolation transaction over the current state.
     ///
     /// The transaction takes its snapshot at this moment: it reads as of the
-    /// most recent commit and is unaffected by commits that happen afterward.
+    /// most recent commit (every commit that has returned is included) and is
+    /// unaffected by commits that happen afterward.
     /// Its writes are checked for write-write conflicts at commit, but its reads
     /// are not validated — use `begin_serializable` (with the `serializable`
     /// feature) when you need serializability.
@@ -326,12 +521,21 @@ impl<S: VersionStore> Db<S> {
     /// Begin a serializable transaction over the current state.
     ///
     /// A serializable transaction tracks every key it reads and, at commit,
-    /// validates that none of them changed since its snapshot — in addition to
-    /// the write-write check every transaction gets. That read-set validation is
-    /// what rejects write skew and the read-only anomaly that plain snapshot
-    /// isolation permits, giving serializable behavior for the transactions that
-    /// commit writes. A serializable transaction that writes nothing commits
-    /// trivially, exactly like a read-only snapshot.
+    /// validates that none of them changed since its snapshot, in addition to
+    /// the write-write check every transaction gets. This is optimistic
+    /// read-set validation (backward validation), not the dangerous-structure
+    /// test of serializable snapshot isolation: it aborts whenever a read key
+    /// changed, so it can abort transactions that SSI would let commit.
+    ///
+    /// Commits that touch overlapping keys take their timestamps in the order
+    /// they apply, so the serialization order of serializable transactions is
+    /// their commit-timestamp order, and every snapshot shows a state that
+    /// order produces. That rejects write skew and the read-only anomaly that
+    /// plain snapshot isolation permits. A serializable transaction that writes
+    /// nothing commits without validation, exactly like a read-only snapshot,
+    /// and sees a serializable state. The guarantee covers serializable
+    /// transactions; a snapshot-isolation writer is not validated and can still
+    /// produce write skew with them.
     ///
     /// Available with the `serializable` feature. Snapshot isolation remains the
     /// default and is unaffected.
@@ -409,7 +613,7 @@ impl<S: VersionStore> Db<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>> {
-        self.snapshot().get(key)
+        self.inner.point_get(key)
     }
 
     /// Write one key in its own transaction, retrying on conflict, and return the
@@ -417,18 +621,21 @@ impl<S: VersionStore> Db<S> {
     ///
     /// A convenience for the common single-write case: it begins a transaction,
     /// buffers the write, and commits. If a concurrent transaction wins the
-    /// commit race it retries against a fresher snapshot, so this is
-    /// last-writer-wins and never surfaces a conflict — the value is always
-    /// installed. When you need to read-then-write atomically, or to control the
-    /// conflict outcome yourself, use [`begin`](Db::begin) instead.
+    /// commit race, it waits until that commit is visible and retries against
+    /// the fresher snapshot, so this is last-writer-wins and does not busy-spin.
+    /// When you need to read-then-write atomically, or to control the conflict
+    /// outcome yourself, use [`begin`](Db::begin) instead.
     ///
     /// # Errors
     ///
     /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
-    /// fails to apply the write, or
+    /// fails to apply the write,
     /// [`TxnError::Durability`](crate::TxnError::Durability) for a durable
-    /// database whose commit cannot be made durable. Conflicts are retried, not
-    /// returned.
+    /// database whose commit cannot be made durable, or
+    /// [`TxnError::TooLarge`](crate::TxnError::TooLarge) for a durable commit
+    /// over the log's record limit. Conflicts are retried, not returned, unless
+    /// 10,000 attempts in a row conflict; the last conflict is then returned
+    /// rather than retrying forever.
     ///
     /// # Examples
     ///
@@ -441,31 +648,23 @@ impl<S: VersionStore> Db<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn put(&self, key: impl Into<Arc<[u8]>>, value: impl Into<Arc<[u8]>>) -> Result<Timestamp> {
-        let key = key.into();
-        let value = value.into();
-        loop {
-            let mut tx = self.begin();
-            tx.put(Arc::clone(&key), Arc::clone(&value));
-            match tx.commit() {
-                Ok(ts) => return Ok(ts),
-                Err(e) if e.is_retryable() => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        self.autocommit(key.into(), Some(value.into()))
     }
 
     /// Delete one key in its own transaction, retrying on conflict, and return
     /// the commit timestamp.
     ///
     /// The delete counterpart of [`put`](Db::put): last-writer-wins, conflicts
-    /// retried. After it returns the key reads as absent until written again.
+    /// retried the same way. After it returns the key reads as absent until
+    /// written again.
     ///
     /// # Errors
     ///
     /// Returns [`TxnError::Store`](crate::TxnError::Store) if the backing store
     /// fails, or [`TxnError::Durability`](crate::TxnError::Durability) for a
     /// durable database whose commit cannot be made durable. Conflicts are
-    /// retried, not returned.
+    /// retried, not returned, unless 10,000 attempts in a row conflict, as for
+    /// [`put`](Db::put).
     ///
     /// # Examples
     ///
@@ -479,13 +678,33 @@ impl<S: VersionStore> Db<S> {
     /// # Ok::<(), txn_db::TxnError>(())
     /// ```
     pub fn delete(&self, key: impl Into<Arc<[u8]>>) -> Result<Timestamp> {
-        let key = key.into();
+        self.autocommit(key.into(), None)
+    }
+
+    /// Commit one write (`Some`) or delete (`None`) of `key`, retrying on
+    /// conflict as [`put`](Db::put) documents.
+    fn autocommit(&self, key: Arc<[u8]>, value: Option<Arc<[u8]>>) -> Result<Timestamp> {
+        let mut attempts = 0u32;
         loop {
             let mut tx = self.begin();
-            tx.delete(Arc::clone(&key));
+            match &value {
+                Some(value) => tx.put(Arc::clone(&key), Arc::clone(value)),
+                None => tx.delete(Arc::clone(&key)),
+            }
             match tx.commit() {
                 Ok(ts) => return Ok(ts),
-                Err(e) if e.is_retryable() => continue,
+                Err(e) if e.is_retryable() => {
+                    attempts += 1;
+                    if attempts >= AUTOCOMMIT_ATTEMPTS {
+                        return Err(e);
+                    }
+                    // The version this attempt lost to was stamped with a
+                    // timestamp that is already allocated. Wait until it is
+                    // visible, so the next attempt reads past it instead of
+                    // spinning against it.
+                    let oracle = &self.inner.oracle;
+                    oracle.wait_visible(oracle.last_allocated());
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -495,7 +714,8 @@ impl<S: VersionStore> Db<S> {
     ///
     /// Returns [`Timestamp::ZERO`] for a database that has never been written.
     /// This is the read watermark: the timestamp a transaction beginning now
-    /// would read at.
+    /// would read at. It is at least the timestamp of every commit that has
+    /// returned.
     ///
     /// # Examples
     ///
@@ -731,6 +951,77 @@ mod tests {
         tx.put(b"k".to_vec(), b"v".to_vec());
         let _ = tx.commit().unwrap();
         assert_eq!(db2.begin().get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[cfg(feature = "durability")]
+    #[test]
+    fn test_failed_log_append_is_never_visible_and_fails_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txn.wal");
+        {
+            let db = Db::open(&path).unwrap();
+            let _ = db.put(b"kept".to_vec(), b"1".to_vec()).unwrap();
+            let before = db.last_committed();
+
+            db.inner.durable_log().unwrap().fail_next_append();
+            let mut tx = db.begin();
+            tx.put(b"kept".to_vec(), b"2".to_vec());
+            tx.put(b"lost".to_vec(), b"x".to_vec());
+            let err = tx.commit().unwrap_err();
+            assert!(matches!(err, crate::TxnError::Durability { .. }));
+
+            // The failed commit's writes were removed before its timestamp was
+            // released, so no reader sees them.
+            assert_eq!(db.get(b"kept").unwrap().as_deref(), Some(&b"1"[..]));
+            assert_eq!(db.get(b"lost").unwrap(), None);
+            assert!(db.last_committed() > before);
+
+            // The database now refuses commits until it is reopened, and an
+            // autocommit write returns the error instead of looping.
+            let err = db.put(b"other".to_vec(), b"y".to_vec()).unwrap_err();
+            assert!(matches!(err, crate::TxnError::Durability { .. }));
+            assert_eq!(db.get(b"other").unwrap(), None);
+
+            // Reads keep working.
+            assert_eq!(
+                db.snapshot().get(b"kept").unwrap().as_deref(),
+                Some(&b"1"[..])
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get(b"kept").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(db.get(b"lost").unwrap(), None);
+        let _ = db.put(b"other".to_vec(), b"y".to_vec()).unwrap();
+    }
+
+    #[cfg(feature = "durability")]
+    #[test]
+    fn test_failed_append_removes_only_its_own_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("txn.wal")).unwrap();
+        for v in 0..3u8 {
+            let _ = db.put(b"k".to_vec(), vec![v]).unwrap();
+        }
+        let snap = db.snapshot();
+        db.inner.durable_log().unwrap().fail_next_append();
+        assert!(db.put(b"k".to_vec(), vec![9]).is_err());
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&[2u8][..]));
+        assert_eq!(snap.get(b"k").unwrap().as_deref(), Some(&[2u8][..]));
+    }
+
+    #[test]
+    fn test_commit_timestamps_follow_apply_order_on_one_key() {
+        // Sequential commits to one key get increasing timestamps and the
+        // newest is what a fresh reader sees.
+        let db = Db::new();
+        let mut last = Timestamp::ZERO;
+        for v in 0..20u8 {
+            let ts = db.put(b"k".to_vec(), vec![v]).unwrap();
+            assert!(ts > last);
+            assert_eq!(db.last_committed(), ts);
+            last = ts;
+        }
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&[19u8][..]));
     }
 
     #[cfg(feature = "serializable")]

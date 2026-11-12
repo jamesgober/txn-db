@@ -21,7 +21,7 @@
         <strong>txn-db</strong> is a <b>multi-version concurrency control</b> transaction engine: the layer that turns a key-value store into a transactional database. Each write produces a new version tagged with a commit timestamp, so readers get a stable snapshot without ever blocking writers, and writers detect conflicts at commit time rather than holding locks for the duration of a transaction.
     </p>
     <p>
-        It is deliberately a <b>layer, not a store</b>: the version store is a trait, so <code>txn-db</code> composes on top of <code>lsm-db</code> or any other backing store, and its durable commit log is <code>wal-db</code>. Snapshot isolation is the default; serializable isolation (SSI) is a feature flag.
+        It is deliberately a <b>layer, not a store</b>: the version store is a trait, so <code>txn-db</code> composes on top of <code>lsm-db</code> or any other backing store, and its durable commit log is <code>wal-db</code>. Snapshot isolation is the default; serializable isolation (read-set validation) is a feature flag.
     </p>
     <p>
         The common case is <code>begin</code> / <code>get</code> / <code>put</code> / <code>commit</code>, with automatic conflict detection and retry guidance on the error path.
@@ -29,10 +29,10 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Snapshot isolation by default. Optional serializable (SSI). Durable commits via wal-db.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Snapshot isolation by default. Optional serializable isolation. Durable commits via wal-db.
     </p>
     <blockquote>
-        <strong>Status: stable (1.0).</strong> The public API is frozen until <code>2.0</code>, and the durable commit-log format is frozen for the <code>1.x</code> series (see <a href="./docs/COMMIT_LOG_FORMAT.md"><code>docs/COMMIT_LOG_FORMAT.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: stable (1.1).</strong> The public API is frozen until <code>2.0</code>, and the durable commit-log format is frozen for the <code>1.x</code> series (see <a href="./docs/COMMIT_LOG_FORMAT.md"><code>docs/COMMIT_LOG_FORMAT.md</code></a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -41,15 +41,16 @@
 
 <h2>What it does</h2>
 
-Available now (`0.5`, feature-complete):
+Available now (`1.x`, stable):
 
 - **MVCC** &mdash; each write creates a new version; readers see a consistent snapshot without blocking writers
 - **Snapshot isolation** &mdash; a transaction reads the database as of its start timestamp; its own writes are visible to itself before commit
-- **Serializable (SSI)** &mdash; opt-in read-set validation under the `serializable` feature, rejecting write skew and the read-only anomaly
-- **Durable commit log** &mdash; under the `durability` feature, `Db::open` logs each commit to a `wal-db` write-ahead log and syncs before acknowledging; the log is replayed on restart
+- **Serializable isolation** &mdash; opt-in optimistic read-set validation under the `serializable` feature, rejecting write skew and the read-only anomaly among serializable transactions; commits that touch overlapping keys take their timestamps in the order they apply, so the serialization order is the commit-timestamp order
+- **Durable commit log** &mdash; under the `durability` feature, `Db::open` logs each commit to a `wal-db` write-ahead log and syncs it before the commit is acknowledged or visible; the log is replayed on restart. One commit's record is limited to 64 MiB; a larger commit is refused with `TxnError::TooLarge` before it has any effect
+- **Read your own commits** &mdash; `commit` returns once its writes are visible, so the next transaction, snapshot, or `Db::get` sees them
 - **Garbage collection** &mdash; `Db::collect_garbage` reclaims versions no live transaction or snapshot can observe; an oldest-reader watermark guarantees a held snapshot's versions are never reclaimed
 - **Write-write conflict detection** &mdash; first-committer-wins at commit; the later writer is told to retry with a typed, retryable error
-- **Sharded commit path** &mdash; lock-free timestamp allocation and per-shard conflict checks, so commits to unrelated keys do not contend (loom-checked)
+- **Sharded commit path** &mdash; per-shard conflict checks and a sharded reader registry, so commits and reads on unrelated keys do not contend on one lock (loom-checked)
 - **Pluggable backing store** &mdash; the version store is the `VersionStore` trait; an in-memory store ships, and any backend (an LSM tree, a B-tree, a remote store) plugs in unchanged
 
 
@@ -59,10 +60,10 @@ Available now (`0.5`, feature-complete):
 
 ```toml
 [dependencies]
-txn-db = "1.0"
+txn-db = "1.1"
 
 # Opt into serializable isolation and/or a durable commit log:
-txn-db = { version = "1.0", features = ["serializable", "durability"] }
+txn-db = { version = "1.1", features = ["serializable", "durability"] }
 ```
 
 <br>
@@ -246,7 +247,7 @@ cargo run --example durable_store --features durability
 
 ## Status
 
-This is `1.0` — **stable**. The engine is feature-complete (snapshot and
+This is `1.1`, **stable**. The engine is feature-complete (snapshot and
 serializable isolation, sharded lock-free commits, a durable `wal-db` commit log,
 watermark garbage collection), tuned, hardened against adversarial schedules, and
 benchmarked honestly. The **public API is frozen until `2.0`** and the durable

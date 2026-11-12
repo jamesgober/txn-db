@@ -25,6 +25,11 @@
 //!   writes at the commit timestamp — atomically with respect to other commits
 //!   touching the same keys. This single method is what makes the store the
 //!   serialization point for concurrent commits.
+//! - [`try_commit_ordered`](VersionStore::try_commit_ordered) does the same but
+//!   takes the commit timestamp from the database while the store holds its
+//!   locks, so commits that touch overlapping keys apply in timestamp order.
+//!   It has a default implementation built on `try_commit`; a store with its
+//!   own locking should override it (see that method).
 //!
 //! ## Sharding
 //!
@@ -117,11 +122,20 @@ pub trait VersionStore: Send + Sync {
     ///    transactions and carries the read set for serializable ones.
     /// 2. **Apply.** If validation passes, install each write in `writes` as a
     ///    new version stamped `commit_ts` (`Some` is a value, `None` a
-    ///    tombstone). The database guarantees `commit_ts` is unique and that
-    ///    timestamps are handed out in increasing order.
+    ///    tombstone). The database guarantees `commit_ts` is unique.
     ///
     /// If any key fails validation, the store applies nothing and reports the
     /// conflict.
+    ///
+    /// Calls do not necessarily arrive in timestamp order: a call with a smaller
+    /// `commit_ts` can come after one with a larger timestamp. The write check in
+    /// step 1 is what keeps each key's versions in ascending timestamp order
+    /// anyway (a later call that would land below an existing version always
+    /// conflicts with it), so a store must not skip it.
+    ///
+    /// A store must not panic once it has started to apply a batch: the database
+    /// releases the timestamp when a store call unwinds, and anything applied at
+    /// that timestamp before the panic becomes visible.
     ///
     /// # Errors
     ///
@@ -136,6 +150,63 @@ pub trait VersionStore: Send + Sync {
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
     ) -> Result<()>;
+
+    /// Validate and apply a transaction like [`try_commit`](Self::try_commit),
+    /// taking the commit timestamp from `stamp` and returning it.
+    ///
+    /// The database calls this method, not `try_commit`, for every commit. The
+    /// store should call `stamp` once, after it holds the locks that serialize
+    /// this commit against every other commit touching an overlapping key (its
+    /// written keys, and its read keys when `reads` is not empty), and after
+    /// validation has passed. Taking the timestamp under those locks is what
+    /// makes the commit-timestamp order agree with the order in which
+    /// overlapping commits apply, which serializable isolation relies on: a
+    /// snapshot cut at any timestamp then reflects a serial order of the commits
+    /// below it. If validation fails, return the conflict without calling
+    /// `stamp`; calling it more than once returns the same timestamp.
+    ///
+    /// The default implementation gets the same ordering without knowing the
+    /// store's locks. It holds a process-wide reader-writer lock across
+    /// `stamp` and [`try_commit`](Self::try_commit): shared for a commit with an
+    /// empty `reads`, exclusive for one that validates a read set. Snapshot
+    /// isolation commits therefore still run in parallel, while a serializable
+    /// commit with reads runs alone. Override this method to take the timestamp
+    /// under the store's own locks instead, as [`MemoryStore`] does.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`try_commit`](Self::try_commit).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use txn_db::{MemoryStore, Timestamp, VersionStore};
+    ///
+    /// let store = MemoryStore::new();
+    /// let key: Arc<[u8]> = Arc::from(&b"k"[..]);
+    /// let ts = store.try_commit_ordered(
+    ///     Timestamp::ZERO,
+    ///     vec![(key, Some(Arc::from(&b"v"[..])))],
+    ///     &[],
+    ///     &|| Timestamp::from_raw(1),
+    /// )?;
+    /// assert_eq!(ts, Timestamp::from_raw(1));
+    /// assert_eq!(store.get(b"k", ts)?.as_deref(), Some(&b"v"[..]));
+    /// # Ok::<(), txn_db::TxnError>(())
+    /// ```
+    fn try_commit_ordered(
+        &self,
+        read_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+        stamp: &dyn Fn() -> Timestamp,
+    ) -> Result<Timestamp> {
+        let _order = DefaultOrder::enter(!reads.is_empty());
+        let commit_ts = stamp();
+        self.try_commit(read_ts, commit_ts, writes, reads)
+            .map(|()| commit_ts)
+    }
 
     /// Reclaim versions that no reader at or after `low_watermark` can observe,
     /// returning how many were removed.
@@ -152,6 +223,51 @@ pub trait VersionStore: Send + Sync {
     fn collect_garbage(&self, low_watermark: Timestamp) -> usize {
         let _ = low_watermark;
         0
+    }
+}
+
+/// The process-wide ordering lock behind the default
+/// [`VersionStore::try_commit_ordered`].
+///
+/// A store that does not override that method gives the database no way to take
+/// a timestamp under the store's own locks. Holding this lock across the
+/// timestamp and the store call keeps a serializable commit that validates a
+/// read set from interleaving with any other commit, so no commit can take a
+/// smaller timestamp and then apply after it. It is the standard library lock,
+/// not the loom model, because loom checks run over [`MemoryStore`], which
+/// overrides the method and never takes this lock.
+static DEFAULT_ORDER: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A held [`DEFAULT_ORDER`] guard, shared or exclusive. The guards are held
+/// only for their drop.
+struct DefaultOrder {
+    _shared: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _exclusive: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+}
+
+impl DefaultOrder {
+    /// Take the ordering lock: exclusive when the commit validates a read set,
+    /// shared otherwise. A poisoned lock is recovered; it guards no data.
+    fn enter(exclusive: bool) -> Self {
+        if exclusive {
+            let guard = match DEFAULT_ORDER.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            DefaultOrder {
+                _shared: None,
+                _exclusive: Some(guard),
+            }
+        } else {
+            let guard = match DEFAULT_ORDER.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            DefaultOrder {
+                _shared: Some(guard),
+                _exclusive: None,
+            }
+        }
     }
 }
 
@@ -183,9 +299,13 @@ struct Shard {
 /// timestamp.
 ///
 /// This is the default store of [`Db::new`](crate::Db::new) and suits caches,
-/// tests, and workloads that fit in memory. Versions accumulate until garbage
-/// collection lands (a later roadmap phase), so a long-lived store under heavy
-/// overwrite grows without bound for now.
+/// tests, and workloads that fit in memory. Every version of a key is kept until
+/// [`Db::collect_garbage`](crate::Db::collect_garbage) reclaims the ones no live
+/// reader can observe, so call it periodically under heavy overwrite.
+///
+/// It overrides [`VersionStore::try_commit_ordered`] and takes the commit
+/// timestamp while it holds the shard locks of the commit, so commits that touch
+/// a shared shard apply in timestamp order without any lock beyond the shards.
 ///
 /// # Examples
 ///
@@ -300,22 +420,43 @@ impl MemoryStore {
                 .push(Version { commit_ts, value });
         }
     }
-}
 
-impl VersionStore for MemoryStore {
-    fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Arc<[u8]>>> {
-        let shard = &self.shards[self.shard_of(key)];
-        let chains = sync::read(&shard.chains);
-        Ok(visible_value(chains.get(key), read_ts))
+    /// Remove the versions a commit at `commit_ts` applied to `keys`.
+    ///
+    /// Used only when a durable commit's log append fails after its writes were
+    /// applied, before its timestamp is released to the watermark. Until then no
+    /// reader can see those versions, and no other commit can have appended a
+    /// version after them (any later writer of the same key reads below
+    /// `commit_ts` and conflicts), so each one is the last of its chain.
+    #[cfg(feature = "durability")]
+    pub(crate) fn remove_versions(&self, commit_ts: Timestamp, keys: &[Arc<[u8]>]) {
+        for key in keys {
+            let shard = self.shard_of(key);
+            let mut chains = sync::write(&self.shards[shard].chains);
+            let now_empty = match chains.get_mut(key.as_ref()) {
+                Some(chain) => {
+                    if chain.last().is_some_and(|v| v.commit_ts == commit_ts) {
+                        let _ = chain.pop();
+                    }
+                    chain.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                let _ = chains.remove(key.as_ref());
+            }
+        }
     }
 
-    fn try_commit(
+    /// Validate and apply one commit under its shard locks, taking the commit
+    /// timestamp from `stamp` once the locks are held and validation passed.
+    fn commit_locked(
         &self,
         read_ts: Timestamp,
-        commit_ts: Timestamp,
         writes: Vec<WriteEntry>,
         reads: &[Arc<[u8]>],
-    ) -> Result<()> {
+        stamp: &dyn Fn() -> Timestamp,
+    ) -> Result<Timestamp> {
         // Fast path for the dominant shape — a single write with no read set to
         // validate. It locks one shard and skips the per-shard bookkeeping
         // (shard-index vectors, sort, dedup, guard vector, and the binary
@@ -327,13 +468,14 @@ impl VersionStore for MemoryStore {
             if newer_than(chains.get(writes[0].0.as_ref()), read_ts) {
                 return Err(TxnError::conflict(writes[0].0.len()));
             }
+            let commit_ts = stamp();
             for (key, value) in writes {
                 chains
                     .entry(key)
                     .or_default()
                     .push(Version { commit_ts, value });
             }
-            return Ok(());
+            return Ok(commit_ts);
         }
 
         // Shard of every touched key, computed once.
@@ -372,6 +514,11 @@ impl VersionStore for MemoryStore {
             }
         }
 
+        // Every shard this commit touches is locked and nothing conflicts: take
+        // the timestamp now, so any overlapping commit that applies later gets a
+        // larger one.
+        let commit_ts = stamp();
+
         // Apply: append a new version for each write under the held locks.
         for ((key, value), &shard) in writes.into_iter().zip(&write_shards) {
             if let Ok(pos) = to_lock.binary_search(&shard) {
@@ -381,7 +528,36 @@ impl VersionStore for MemoryStore {
                     .push(Version { commit_ts, value });
             }
         }
-        Ok(())
+        Ok(commit_ts)
+    }
+}
+
+impl VersionStore for MemoryStore {
+    fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Arc<[u8]>>> {
+        let shard = &self.shards[self.shard_of(key)];
+        let chains = sync::read(&shard.chains);
+        Ok(visible_value(chains.get(key), read_ts))
+    }
+
+    fn try_commit(
+        &self,
+        read_ts: Timestamp,
+        commit_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+    ) -> Result<()> {
+        self.commit_locked(read_ts, writes, reads, &|| commit_ts)
+            .map(|_| ())
+    }
+
+    fn try_commit_ordered(
+        &self,
+        read_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+        stamp: &dyn Fn() -> Timestamp,
+    ) -> Result<Timestamp> {
+        self.commit_locked(read_ts, writes, reads, stamp)
     }
 
     fn collect_garbage(&self, low_watermark: Timestamp) -> usize {

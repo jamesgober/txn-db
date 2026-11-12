@@ -16,7 +16,7 @@
 
 > Complete reference for every public item in `txn-db`, with examples.
 >
-> **Status: stable (1.0).** The surface documented here is **frozen until `2.0`**.
+> **Status: stable (1.1).** The surface documented here is **frozen until `2.0`**.
 > It arrived across the 0.x series — snapshot isolation (`0.2`), serializable
 > (`0.3`), durability (`0.4`), garbage collection (`0.5`), the optimization pass
 > (`0.6`), hardening + freeze (`0.7`), the autocommit convenience (`0.8`), and the
@@ -67,7 +67,7 @@ Run any of them with `cargo run --example <name>`.
 
 ```toml
 [dependencies]
-txn-db = "1.0"
+txn-db = "1.1"
 ```
 
 MSRV is Rust 1.85 (the 2024 edition). The crate is `forbid(unsafe_code)`.
@@ -97,7 +97,8 @@ power stays reachable.
 
 - **Tier 1 — the common case.** [`Db::new`](#db), [`Db::begin`](#db), and the
   [`Transaction`](#transaction) methods. No builder, no generics to name.
-- **Tier 2 — configuration.** A builder for tuning, arriving in a later phase.
+- **Tier 2: configuration.** Not yet available. The durable database uses
+  fixed settings, including a 64 MiB limit on one commit's log record.
 - **Tier 3 — the power path.** The [`VersionStore`](#versionstore) trait, the
   seam for custom backends, reached through [`Db::with_store`](#db).
 
@@ -142,7 +143,7 @@ written `Db` with no generics in the common case.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `new` | `fn new() -> Db<MemoryStore>` | An empty in-memory database. The default configuration. |
-| `open` | `fn open(path) -> Result<Db<MemoryStore>>` | A durable database backed by a write-ahead log at `path`, replaying committed transactions on startup. Requires the `durability` feature. |
+| `open` | `fn open(path) -> Result<Db<MemoryStore>>` | A durable database backed by a write-ahead log at `path`, replaying committed transactions on startup. One commit's record is limited to 64 MiB. Requires the `durability` feature. |
 | `with_store` | `fn with_store(store: S) -> Db<S>` | A database over a custom [`VersionStore`](#versionstore). The Tier-3 seam. |
 | `default` | `fn default() -> Db<MemoryStore>` | Equivalent to `Db::new()`. |
 
@@ -154,9 +155,9 @@ written `Db` with no generics in the common case.
 | `begin_serializable` | `fn begin_serializable(&self) -> Transaction<S>` | Start a serializable transaction (read set validated at commit). Requires the `serializable` feature. |
 | `snapshot` | `fn snapshot(&self) -> Snapshot<S>` | Take a read-only, point-in-time view. |
 | `get` | `fn get(&self, key: &[u8]) -> Result<Option<Arc<[u8]>>>` | Autocommit read of one key (takes a snapshot and reads it). |
-| `put` | `fn put(&self, key, value) -> Result<Timestamp>` | Autocommit write of one key, retrying on conflict (last-writer-wins). |
+| `put` | `fn put(&self, key, value) -> Result<Timestamp>` | Autocommit write of one key, retrying on conflict (last-writer-wins). Each retry first waits for the commit it lost to become visible; after 10,000 conflicts in a row the conflict is returned. |
 | `delete` | `fn delete(&self, key) -> Result<Timestamp>` | Autocommit delete of one key, retrying on conflict. |
-| `last_committed` | `fn last_committed(&self) -> Timestamp` | The timestamp of the most recent commit; `Timestamp::ZERO` if none. |
+| `last_committed` | `fn last_committed(&self) -> Timestamp` | The timestamp of the most recent commit visible to a new transaction (at least that of every commit that has returned); `Timestamp::ZERO` if none. |
 | `collect_garbage` | `fn collect_garbage(&self) -> usize` | Reclaim versions no live transaction or snapshot can observe; returns the count removed. |
 | `clone` | `fn clone(&self) -> Self` | A new handle to the same database. |
 
@@ -407,6 +408,7 @@ pub enum TxnError {
     Conflict { key_len: usize },
     Store { context: &'static str, detail: String },
     Durability { detail: String },
+    TooLarge { len: usize, limit: usize },
 }
 ```
 
@@ -419,9 +421,10 @@ The crate error type. It implements `std::error::Error`, `Display`, `Clone`,
 
 | Variant | Meaning | What to do |
 |---------|---------|------------|
-| `Conflict { key_len }` | A write-write conflict aborted the commit; another transaction committed a change to a written key after this one's snapshot. Only the key length is carried, never its bytes, so the error is safe to log. | Retry: begin a fresh transaction, re-read, re-apply, commit again. |
+| `Conflict { key_len }` | A conflict aborted the commit: another transaction committed a change to a written key after this one's snapshot, or, for a serializable transaction, to a key it read. Only the key length is carried, never its bytes, so the error is safe to log. | Retry: begin a fresh transaction, re-read, re-apply, commit again. |
 | `Store { context, detail }` | The backing [`VersionStore`](#versionstore) failed a read or apply. The in-memory store never produces this. | Store-specific; inspect the variant. |
-| `Durability { detail }` | The durable commit log failed, or a record read during recovery did not decode. Produced only with the `durability` feature. An unacknowledged commit is never durable, but the durability guarantee is in doubt — `is_fatal` is `true`. | Treat as unrecoverable; do not retry blindly. |
+| `Durability { detail }` | The durable commit log failed, or a record read during recovery did not decode. Produced only with the `durability` feature. A commit that fails here is not acknowledged and its writes are removed before any reader sees them, but the log file's state is in doubt: the database refuses every later commit with this error until it is reopened, and the failed commit may still be present after reopening if its record reached the disk before the sync failed. `is_fatal` is `true`. | Reopen the database; do not retry blindly. |
+| `TooLarge { len, limit }` | A durable commit's encoded record (`len` bytes) exceeds the commit log's record limit (`limit`, 64 MiB). Checked before anything is applied or logged, so the commit has no effect and the database stays usable. Produced only with the `durability` feature. Neither retryable nor fatal. | Split the work into smaller transactions. |
 
 #### Methods
 
@@ -475,6 +478,17 @@ pub trait VersionStore: Send + Sync {
         reads: &[Arc<[u8]>],
     ) -> Result<()>;
 
+    // Provided method: takes the commit timestamp from `stamp`. The default
+    // calls `stamp` and then `try_commit` under a process-wide ordering lock;
+    // override it to take the timestamp under the store's own locks.
+    fn try_commit_ordered(
+        &self,
+        read_ts: Timestamp,
+        writes: Vec<WriteEntry>,
+        reads: &[Arc<[u8]>],
+        stamp: &dyn Fn() -> Timestamp,
+    ) -> Result<Timestamp> { /* … */ }
+
     // Provided method (default no-op); override to reclaim history.
     fn collect_garbage(&self, low_watermark: Timestamp) -> usize { 0 }
 }
@@ -484,7 +498,8 @@ The Tier-3 seam: the backend a [`Db`](#db) is built on. The transaction layer
 supplies the snapshot timestamps and the read and write sets; the store stores
 versions and is the serialization point that validates and applies each commit
 atomically. Implementations must be `Send + Sync`. Only `get` and `try_commit`
-are required; `collect_garbage` defaults to doing nothing.
+are required; `try_commit_ordered` has a default built on `try_commit`, and
+`collect_garbage` defaults to doing nothing.
 
 A custom store signals a conflict from `try_commit` with
 [`TxnError::conflict`](#txnerror), and a backend failure with
@@ -496,7 +511,8 @@ store](#implementing-a-custom-store).
 | Method | Obligation |
 |--------|------------|
 | `get` | Return the newest version of `key` whose commit timestamp is `<= read_ts`. A tombstone at that position reads as `None`. |
-| `try_commit` | As one step, atomic against any other `try_commit` touching an overlapping key: **validate** that no key in `writes` or `reads` has a version newer than `read_ts`, and if all pass, **apply** each write as a new version stamped `commit_ts`. `reads` is empty for snapshot-isolation transactions and carries the read set for serializable ones. The database hands out `commit_ts` uniquely and in increasing order. |
+| `try_commit` | As one step, atomic against any other `try_commit` touching an overlapping key: **validate** that no key in `writes` or `reads` has a version newer than `read_ts`, and if all pass, **apply** each write as a new version stamped `commit_ts`. `reads` is empty for snapshot-isolation transactions and carries the read set for serializable ones. `commit_ts` is unique, but calls can arrive out of timestamp order; the write check is what keeps each key's versions ascending, so it must not be skipped. A store must not panic once it has started applying: the database releases the timestamp on unwind, and anything applied by then becomes visible. |
+| `try_commit_ordered` | The same validate-and-apply, but call `stamp` for the commit timestamp after the locks that serialize this commit against overlapping ones are held and validation has passed, and return it. On a conflict, return without calling `stamp`. The database calls this method for every commit. The default calls `stamp` and then `try_commit` while holding a process-wide lock (shared when `reads` is empty, exclusive otherwise), which keeps serializable isolation correct for any store. |
 | `collect_garbage` | Reclaim versions no reader at or after `low_watermark` can observe, returning the count removed. Defaults to a no-op, so a store that keeps no history need not implement it. |
 
 **Errors**: `try_commit` returns [`TxnError::Conflict`](#txnerror) if validation
@@ -623,13 +639,28 @@ commit, because neither wrote what the other read.
 
 Serializable isolation ([`Db::begin_serializable`](#db)) additionally validates
 the **read set** at commit: if any key the transaction read changed after its
-snapshot, the commit is rejected. That closes write skew and the read-only
-anomaly, making the set of committing (writing) transactions serializable; a
-serializable transaction that writes nothing commits trivially, since it observed
-a consistent snapshot. This is optimistic read-set validation — it can reject a
-transaction that a more permissive scheme would allow, so retry-on-conflict
-applies to serializable transactions too. The serialization order is the commit
-order.
+snapshot, the commit is rejected. This is optimistic read-set validation
+(backward validation), not serializable snapshot isolation (SSI): it aborts
+whenever a read key changed rather than only on a dangerous structure, so it can
+reject a transaction that SSI would allow, and retry-on-conflict applies to
+serializable transactions too.
+
+Commits that touch overlapping keys (written keys, and read keys for a
+serializable commit) take their commit timestamps while the store holds their
+locks, so they apply in timestamp order. The serialization order of serializable
+transactions is therefore their commit-timestamp order, and every snapshot,
+which is cut at a timestamp, shows a state of that order. That closes write
+skew and the read-only anomaly. A serializable transaction that writes nothing
+commits without validation and has observed a state of the serial order. The
+guarantee covers serializable transactions; a snapshot-isolation writer is not
+validated and can still form write skew with them.
+
+A custom [`VersionStore`](#versionstore) gets the same ordering through the
+default `try_commit_ordered`, which holds a process-wide lock across the
+timestamp and the store call (shared for commits without a read set, exclusive
+for serializable commits that validate one). A store with its own locking should
+override `try_commit_ordered` and take the timestamp under those locks, as
+`MemoryStore` does.
 
 Because the API exposes only point reads, there are no range predicates and so no
 range phantoms to consider; a read of an absent key is validated like any other,
@@ -740,7 +771,8 @@ assert!(t2.commit().is_err());   // t2 read x, which t1 changed
 
 Open the database with [`Db::open`](#db) (the `durability` feature) to back it
 with a write-ahead log. Each commit is appended and synced before it is
-acknowledged, and the log is replayed on the next open.
+acknowledged and before any reader can see it, and the log is replayed on the
+next open.
 
 ```rust
 # #[cfg(feature = "durability")]
@@ -768,7 +800,24 @@ transaction that aborted, or that the process never managed to make durable, is
 simply absent on reopen. A torn record at the tail of the log — a crash
 mid-append — is discarded when the log is opened, so recovery always yields a
 clean prefix of commits. Commit timestamps resume strictly after the highest
-recovered timestamp.
+recovered timestamp. Old versions are collected once after replay.
+
+Limits and failures:
+
+- **Record limit.** One commit's encoded record must fit in 64 MiB (the
+  `wal-db` default). The encoded size is 13 bytes, plus for each write 5 bytes
+  and the key, plus for each value (not a delete) 4 bytes and the value. A
+  larger commit returns [`TxnError::TooLarge`](#txnerror) before anything is
+  applied or logged, and the database stays usable.
+- **Log failure.** If appending or syncing a record fails (a full disk, an I/O
+  error), the commit returns [`TxnError::Durability`](#txnerror) and its writes
+  are removed before any reader can see them. The database then refuses every
+  later commit with the same error until it is reopened, because the log file's
+  state is in doubt. A commit reported this way may still appear after reopening
+  if its record reached the disk before the sync failed.
+- **Log growth.** The log is never truncated. It grows by one record per commit,
+  and opening it replays every record, so open time grows with the number of
+  commits ever made.
 
 ### Reclaiming old versions
 

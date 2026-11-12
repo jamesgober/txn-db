@@ -31,13 +31,16 @@ pub type Result<T, E = TxnError> = core::result::Result<T, E>;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnError {
-    /// A write-write conflict aborted the transaction at commit time.
+    /// A conflict aborted the transaction at commit time.
     ///
     /// Under snapshot isolation the database applies *first-committer-wins*:
     /// when a transaction commits, every key it wrote is checked against the
     /// version store, and if any of those keys was written by a different
     /// transaction that committed *after* this one took its snapshot, this
     /// commit is rejected. None of its writes are applied.
+    ///
+    /// A serializable transaction is also rejected with this variant when a key
+    /// it read (and did not write) changed after its snapshot.
     ///
     /// This is the mechanism that prevents lost updates, and it is a normal
     /// part of operating under optimistic concurrency control. The correct
@@ -74,13 +77,31 @@ pub enum TxnError {
     /// Produced only with the `durability` feature: when appending or syncing a
     /// commit record fails, or when recovery on [`Db::open`](crate::Db) reads a
     /// record whose bytes do not decode. A commit that fails to become durable
-    /// is *not* acknowledged — the contract that an acknowledged commit survives
-    /// a crash holds — but the failure is fatal in the sense that the database's
-    /// durability guarantee is in question, so treat it as unrecoverable rather
-    /// than retrying blindly.
+    /// is *not* acknowledged and its writes are removed before any reader can
+    /// see them. The failure is fatal: the database refuses every later commit
+    /// with this variant until it is reopened, because the state of the log
+    /// file is in doubt. A commit reported with this error may still be found
+    /// after reopening if its record reached the disk before the sync failed.
     Durability {
         /// A human-readable description of the durability failure.
         detail: String,
+    },
+
+    /// A durable transaction's commit record would exceed the commit log's
+    /// record limit.
+    ///
+    /// Produced only with the `durability` feature, by a database opened with
+    /// [`Db::open`](crate::Db). The record limit is 64 MiB (the `wal-db`
+    /// default). The encoded size of a commit is 13 bytes plus, for each write,
+    /// 5 bytes and the key, and for a value (not a delete) 4 more bytes and the
+    /// value. The check runs before anything is applied or logged, so the
+    /// transaction has no effect and the database stays usable. It is not
+    /// retryable: split the work into smaller transactions.
+    TooLarge {
+        /// The encoded size of the rejected commit record, in bytes.
+        len: usize,
+        /// The largest record the commit log accepts, in bytes.
+        limit: usize,
     },
 }
 
@@ -131,6 +152,14 @@ impl TxnError {
         }
     }
 
+    /// Build a [`TxnError::TooLarge`] for a record of `len` bytes.
+    #[cfg(feature = "durability")]
+    #[inline]
+    #[must_use]
+    pub(crate) fn too_large(len: usize, limit: usize) -> Self {
+        TxnError::TooLarge { len, limit }
+    }
+
     /// Returns `true` if re-running the transaction is the right response.
     ///
     /// A [`Conflict`](TxnError::Conflict) is retryable: another transaction won
@@ -176,7 +205,7 @@ impl fmt::Display for TxnError {
         match self {
             TxnError::Conflict { key_len } => write!(
                 f,
-                "write-write conflict on a {key_len}-byte key; retry the transaction"
+                "commit conflict on a {key_len}-byte key written or read since the snapshot; retry the transaction"
             ),
             TxnError::Store { context, detail } => {
                 write!(f, "version store error while {context}: {detail}")
@@ -184,6 +213,10 @@ impl fmt::Display for TxnError {
             TxnError::Durability { detail } => {
                 write!(f, "durable commit log error: {detail}")
             }
+            TxnError::TooLarge { len, limit } => write!(
+                f,
+                "commit record of {len} bytes exceeds the {limit}-byte log record limit; split the transaction"
+            ),
         }
     }
 }
@@ -196,6 +229,7 @@ impl ForgeError for TxnError {
             TxnError::Conflict { .. } => "Conflict",
             TxnError::Store { .. } => "Store",
             TxnError::Durability { .. } => "Durability",
+            TxnError::TooLarge { .. } => "TooLarge",
         }
     }
 
@@ -213,9 +247,10 @@ impl ForgeError for TxnError {
         TxnError::is_retryable(self)
     }
 
-    /// A [`Conflict`](TxnError::Conflict) is the retry signal and a
-    /// [`Store`](TxnError::Store) failure is the store's to classify, so neither
-    /// is fatal. A [`Durability`](TxnError::Durability) failure puts the crash
+    /// A [`Conflict`](TxnError::Conflict) is the retry signal, a
+    /// [`Store`](TxnError::Store) failure is the store's to classify, and a
+    /// [`TooLarge`](TxnError::TooLarge) commit had no effect, so none of them is
+    /// fatal. A [`Durability`](TxnError::Durability) failure puts the crash
     /// guarantee in doubt and is reported as fatal.
     fn is_fatal(&self) -> bool {
         matches!(self, TxnError::Durability { .. })
@@ -276,12 +311,21 @@ mod tests {
                 false,
                 true,
             ),
+            (
+                TxnError::TooLarge {
+                    len: 100,
+                    limit: 10,
+                },
+                false,
+                false,
+            ),
         ];
         for (err, _, _) in &cases {
             match err {
                 TxnError::Conflict { .. }
                 | TxnError::Store { .. }
-                | TxnError::Durability { .. } => {}
+                | TxnError::Durability { .. }
+                | TxnError::TooLarge { .. } => {}
             }
         }
         cases

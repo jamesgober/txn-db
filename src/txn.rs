@@ -38,19 +38,26 @@ use crate::timestamp::Timestamp;
 struct ActiveReader<S: VersionStore> {
     inner: Arc<Inner<S>>,
     read_ts: Timestamp,
+    /// The registry slot the reader was recorded in. Kept with the handle so it
+    /// unregisters from the same slot even when dropped on another thread.
+    slot: usize,
 }
 
 impl<S: VersionStore> ActiveReader<S> {
     /// Register a reader against `inner`, reading at the current watermark.
     fn new(inner: Arc<Inner<S>>) -> Self {
-        let read_ts = inner.begin_reader();
-        ActiveReader { inner, read_ts }
+        let (read_ts, slot) = inner.begin_reader();
+        ActiveReader {
+            inner,
+            read_ts,
+            slot,
+        }
     }
 }
 
 impl<S: VersionStore> Drop for ActiveReader<S> {
     fn drop(&mut self) {
-        self.inner.end_reader(self.read_ts);
+        self.inner.end_reader(self.read_ts, self.slot);
     }
 }
 
@@ -173,7 +180,10 @@ impl<S: VersionStore> Transaction<S> {
         // A serializable transaction records the key — present or absent — so a
         // later writer to it is caught at commit.
         if let Some(reads) = &self.reads {
-            let _ = reads.borrow_mut().insert(Arc::from(key));
+            let mut reads = reads.borrow_mut();
+            if !reads.contains(key) {
+                let _ = reads.insert(Arc::from(key));
+            }
         }
         Ok(value)
     }
@@ -234,7 +244,12 @@ impl<S: VersionStore> Transaction<S> {
     /// Commit the transaction, applying all buffered writes atomically.
     ///
     /// On success every buffered write becomes visible to transactions that
-    /// begin afterward, and the commit timestamp is returned. A transaction
+    /// begin afterward, and the commit timestamp is returned. `commit` returns
+    /// only once the write is visible, so the calling thread (or any thread it
+    /// signals) reads its own committed write from the next transaction,
+    /// snapshot, or [`Db::get`](crate::Db::get). If a commit with an earlier
+    /// timestamp is still in flight, `commit` waits for it to finish first. A
+    /// transaction
     /// that buffered no writes commits trivially and returns its snapshot
     /// timestamp without allocating a new one — including a serializable
     /// read-only transaction, which has observed a consistent snapshot and needs

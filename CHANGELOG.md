@@ -18,6 +18,87 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.0] - 2026-11-12
+
+Correctness release. Fixes a durable commit that could be seen and then lost,
+the read-only anomaly under `serializable`, a store panic that stopped every
+later commit from becoming visible, and commits that returned before their own
+write was visible. Adds `TxnError::TooLarge` and
+`VersionStore::try_commit_ordered`. No breaking change; the commit-log format is
+unchanged and logs written by 1.0 replay as before. MSRV stays 1.85.
+
+### Fixed
+
+- **A durable commit whose log write failed was visible, then lost.** The
+  writes were applied in memory before the record was appended, and on an
+  append or sync failure the timestamp was still released, so every reader saw
+  data that was gone after a restart while transactions that read it committed
+  durably. A commit over `wal-db`'s 64 MiB record limit always took this path.
+  Now a failed append removes the commit's writes before its timestamp is
+  released, so no reader can see them, and the database refuses every later
+  commit with `TxnError::Durability` until it is reopened (the log file's state
+  is in doubt after a failed write or sync).
+- **Oversize durable commits** are refused up front with the new
+  `TxnError::TooLarge { len, limit }`, before anything is applied or logged. The
+  limit (64 MiB per commit record) and the record size formula are documented on
+  `Db::open`, `TxnError::TooLarge`, and in `docs/API.md`. The database stays
+  usable after this error.
+- **The read-only anomaly survived `serializable`.** A commit took its timestamp
+  before it got the store's locks, so a commit with a smaller timestamp could
+  apply after one with a larger timestamp, and a read-only transaction cut
+  between them saw a state no serial order produces. Commits now take their
+  timestamp while the store holds their locks (`MemoryStore`), or under a
+  process-wide ordering lock for a custom store that keeps the default
+  `try_commit_ordered`. The serialization order of serializable transactions is
+  now their commit-timestamp order, as the docs claimed.
+- **A panic inside `VersionStore::try_commit` stopped the read watermark for
+  good:** every later commit returned `Ok` and was never visible, memory grew per
+  commit, and `Db::put` could loop forever. The commit timestamp is now held by
+  a guard that releases it on every path out of the commit, including unwinding,
+  so a panic costs one transaction.
+- **`commit` returned before its write was visible** when an earlier commit was
+  still in flight, so a thread could fail to read its own committed write.
+  `commit` now returns once the write is visible (it spins briefly, then waits).
+  `Db::begin` and `Db::last_committed` therefore include every commit that has
+  returned.
+- **`Db::put` and `Db::delete` busy-spun** against a conflicting version that was
+  not visible yet. They now wait until the commit they lost to is visible before
+  retrying, and return the conflict after 10,000 conflicts in a row instead of
+  looping without bound.
+- The conflict message no longer says "write-write" for a serializable read-set
+  conflict.
+
+### Added
+
+- `TxnError::TooLarge { len, limit }` (`durability` feature). `TxnError` is
+  `#[non_exhaustive]`, so this is additive.
+- `VersionStore::try_commit_ordered`, a provided trait method that takes the
+  commit timestamp from a callback while the store holds its locks. The database
+  calls it for every commit. The default is built on `try_commit` and needs no
+  change to existing stores; `MemoryStore` overrides it.
+- Regression tests for each fix (`tests/ordering.rs`, plus an injected log-append
+  failure in the unit tests) and a loom model of a read-only transaction cut
+  between two overlapping serializable commits. The loom CI job now runs with
+  `--features serializable`.
+
+### Changed
+
+- The live-reader registry used by garbage collection is split into 32 slots on
+  separate cache lines instead of one mutex-guarded map, and `Db::get` no longer
+  clones the database handle per read. `Db::get` throughput now rises with
+  threads instead of falling (see `docs/PERFORMANCE.md`).
+- `Db::open` collects the replayed history once after recovery, so a reopened
+  database holds the current version of each key rather than every version ever
+  logged.
+- A serializable read of a key already in the read set no longer allocates.
+- Documentation: the serializable mode is described as optimistic read-set
+  validation, not SSI; stale status text in the crate docs, README, and
+  `MemoryStore` docs is corrected; the `VersionStore::try_commit` contract states
+  that calls can arrive out of timestamp order; the durable-log failure,
+  record-limit, and log-growth behaviour is documented.
+
+---
+
 ## [1.0.1] - 2026-10-08
 
 Patch release. Fixes `TxnError`'s `error-forge` retry metadata; no API change.
@@ -353,7 +434,8 @@ Initial scaffold and repository bootstrap. No txn-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/txn-db/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/txn-db/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/jamesgober/txn-db/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/txn-db/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/txn-db/compare/v0.8.0...v0.9.0

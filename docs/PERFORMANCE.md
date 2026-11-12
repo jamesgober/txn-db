@@ -61,9 +61,9 @@ In-memory store, default features, one thread:
 ## Contention scaling
 
 Committed transactions per second, by writer count. Independent (`disjoint`) work
-scales with sharding until per-transaction global bookkeeping — the
-garbage-collection reader registry and the commit watermark — bounds it past a
-few writers. The single-key `contended` workload is the worst case: every writer
+scales with sharding until per-transaction global bookkeeping bounds it past a
+few writers. These figures predate 1.1, which sharded the reader registry; see
+the 1.1 entry in the optimization log. The single-key `contended` workload is the worst case: every writer
 fights over one key and most commits retry.
 
 | Writers | `disjoint_commits` | `contended_commits` |
@@ -110,8 +110,10 @@ Reading the table:
   bare map has.
 - **Concurrent reads scale where the single lock cannot.** With one writer
   committing continuously, txn-db sustains roughly **3× the read throughput**: a
-  snapshot read never waits for a writer, whereas every reader on the
-  `RwLock` baseline blocks whenever the writer holds the exclusive lock. This is
+  snapshot read never waits for a writer's transaction, only for the short
+  shard lock a commit holds while it applies (garbage collection holds the same
+  lock while it walks a shard), whereas every reader on the `RwLock` baseline
+  blocks whenever the writer holds the exclusive lock. This is
   the whole point of multi-version concurrency control, and it is the workload —
   read-mostly with concurrent writes — where the write overhead pays for itself.
 
@@ -121,6 +123,53 @@ moment you need snapshot isolation, conflict detection, or concurrent readers
 that do not stall behind writers, the trade inverts.
 
 ## Optimization log
+
+### v1.1.0 — sharded reader registry, ordered commits
+
+Every transaction, snapshot, and `Db::get` used to register its read timestamp
+in one mutex-guarded map, twice per read, so point reads got slower in total as
+threads were added. The registry is now 32 slots on separate cache lines; a
+thread registers in its own slot, and garbage collection reads the watermark
+first and then the minimum over all slots. `Db::get` also no longer clones the
+database handle per read.
+
+The same release makes three correctness changes that touch the commit path:
+the commit timestamp is taken inside the store's shard locks (one atomic
+increment moved into the critical section), `commit` waits until every earlier
+timestamp is finished so its own write is visible when it returns (it spins
+briefly, then yields, then parks), and `Db::put` waits for the commit it lost to
+instead of spinning.
+
+A/B in one process against txn-db 1.0.1 from crates.io, alternating rounds,
+median of 7 with the range across rounds in brackets, total throughput in Mops/s. The host was fully
+loaded by unrelated work during these runs, so multi-threaded figures are noisy.
+
+| Workload | 1.0.1 | 1.1.0 |
+|----------|------:|------:|
+| `Db::get`, 1 thread | 11.5 [10.4-12.8] | 15.2 [14.4-15.8] |
+| `Db::get`, 4 threads | 6.1 [3.7-7.2] | 17.5 [13.9-38.6] |
+| `Db::get`, 8 threads | 4.1 [3.6-4.8] | 17.2 [8.5-27.9] |
+| `Db::get`, 16 threads | 3.1 [2.5-3.4] | 24.1 [17.2-28.9] |
+| `Db::put`, disjoint keys, 1 thread | 1.39 [0.33-1.64] | 1.69 [0.54-1.76] |
+| `Db::put`, disjoint keys, 4 threads | 1.23 [1.12-1.58] | 1.91 [0.30-2.73] |
+| `Db::put`, disjoint keys, 8 threads | 0.69 [0.18-1.47] | 1.33 [0.45-2.14] |
+| `Db::put`, one hot key, 1 thread | 1.89 [1.44-1.97] | 1.95 [1.41-2.09] |
+| `Db::put`, one hot key, 4 threads | 0.40 [0.07-0.60] | 1.10 [1.07-1.95] |
+| 4-key transaction (SI), 1 thread | 0.25 [0.09-0.26] | 0.23 [0.02-0.26] |
+| 4-key transaction (SI), 4 threads | 0.44 [0.34-0.57] | 0.21 [0.14-0.24] |
+| 4-key transaction (SI), 8 threads | 0.16 [0.15-0.28] | 0.24 [0.16-0.28] |
+| 4-key transaction (serializable), 8 threads | 0.24 [0.11-0.27] | 0.14 [0.11-0.30] |
+
+`Db::get` now scales with threads instead of falling. Hot-key autocommit writes
+no longer burn cores retrying against a version that is not yet visible.
+Multi-key transactions on several threads moved in both directions across
+repeated runs (from about half to about one and a half times 1.0.1) and stayed
+within the noise of this host. A variant that grows long version chains on
+shared shards was slower in 1.1 in most runs, consistent with the timestamp now
+being taken inside the shard locks, which lengthens each multi-shard critical
+section by one contended atomic increment. That cost buys the ordering that
+serializable isolation needs; measure multi-key write-heavy workloads on your
+own hardware.
 
 ### v0.6.0 — single-write commit fast path
 
@@ -146,11 +195,18 @@ got materially cheaper, while reads and large multi-key batches were unaffected.
 
 ## Known limits and future work
 
-- **Per-transaction global locks.** Each transaction registers and unregisters a
-  reader timestamp (for GC) under one mutex, and each commit advances the read
-  watermark under another. These bound `disjoint` scaling past ~4 writers. A
-  lock-free watermark fast path for in-order commits, and a cheaper reader
-  registry, are the natural next targets.
+- **Per-commit global work.** The reader registry is sharded (1.1), but each
+  commit still takes one global atomic increment inside its shard locks and
+  advances the read watermark under one mutex. A lock-free watermark fast path
+  for in-order commits is the natural next target.
+- **Commit waits for earlier commits.** `commit` returns only once every earlier
+  timestamp has finished, so its write is visible. With a durable log that can
+  include an earlier commit's fsync, which group commit usually shares anyway.
+- **Garbage collection holds each shard's write lock** while it walks every key
+  in the shard, even when nothing is reclaimable (about 3 ms per shard for a
+  million single-version keys). Reads and commits on that shard wait meanwhile.
+- **The commit log is never truncated.** `Db::open` replays every record ever
+  written; there is no checkpoint yet.
 - **Single hot key.** No design makes concurrent commits to *one* key parallel;
   the answer is application-level sharding of the key, or batching.
 

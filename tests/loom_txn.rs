@@ -16,7 +16,7 @@
 //! Run with:
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --test loom_txn --release
+//! RUSTFLAGS="--cfg loom" cargo test --test loom_txn --release --features serializable
 //! ```
 
 #![cfg(loom)]
@@ -118,5 +118,69 @@ fn loom_disjoint_commits_both_succeed_and_are_visible() {
         let snap = db.snapshot();
         assert_eq!(snap.get(&[1u8]).unwrap().as_deref(), Some(&[10u8][..]));
         assert_eq!(snap.get(&[2u8]).unwrap().as_deref(), Some(&[20u8][..]));
+    });
+}
+
+/// The read-only anomaly schedule of Fekete, O'Neil and O'Neil, all three
+/// transactions serializable: W withdraws from checking `X` with a penalty when
+/// it sees `X + Y < 10`, D deposits into savings `Y`, and a read-only R reads
+/// both while the two commits race. Whatever the interleaving, R's view must be
+/// a state of the serial order the outcome implies, and that order must be the
+/// commit-timestamp order. Commits take their timestamps under the store's
+/// shard locks, which is what makes this hold.
+#[cfg(feature = "serializable")]
+#[test]
+fn loom_reader_between_overlapping_serializable_commits_sees_a_serial_state() {
+    fn int(v: Option<std::sync::Arc<[u8]>>) -> i8 {
+        v.map_or(0, |b| b[0] as i8)
+    }
+
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(|| {
+        let db = Db::new();
+        {
+            let mut tx = db.begin();
+            tx.put(vec![b'X'], vec![0u8]);
+            tx.put(vec![b'Y'], vec![0u8]);
+            tx.commit().unwrap();
+        }
+
+        // Both writers take their snapshots before either commits.
+        let mut w = db.begin_serializable();
+        let x = int(w.get(b"X").unwrap());
+        let y = int(w.get(b"Y").unwrap());
+        let nx = if x + y < 10 { x - 11 } else { x - 10 };
+        w.put(vec![b'X'], vec![nx as u8]);
+        let mut d = db.begin_serializable();
+        let dy = int(d.get(b"Y").unwrap());
+        d.put(vec![b'Y'], vec![(dy + 20) as u8]);
+
+        let wh = loom::thread::spawn(move || w.commit().ok());
+        let dh = loom::thread::spawn(move || d.commit().ok());
+
+        let r = db.begin_serializable();
+        let view = (int(r.get(b"X").unwrap()), int(r.get(b"Y").unwrap()));
+        let _ = r.commit().unwrap();
+
+        let w_ts = wh.join().unwrap();
+        let d_ts = dh.join().unwrap().expect("D validates only its own write");
+        let snap = db.snapshot();
+        let fin = (int(snap.get(b"X").unwrap()), int(snap.get(b"Y").unwrap()));
+
+        match w_ts {
+            None => {
+                assert_eq!(fin, (0, 20));
+                assert!(view == (0, 0) || view == (0, 20), "{view:?}");
+            }
+            Some(w_ts) if fin.0 == -11 => {
+                assert!(w_ts < d_ts);
+                assert!([(0, 0), (-11, 0), (-11, 20)].contains(&view), "{view:?}");
+            }
+            Some(w_ts) => {
+                assert!(d_ts < w_ts);
+                assert!([(0, 0), (0, 20), (-10, 20)].contains(&view), "{view:?}");
+            }
+        }
     });
 }

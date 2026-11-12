@@ -49,7 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Loom
-        run: cargo test --test loom_txn --release
+        run: cargo test --test loom_txn --release --features serializable
         env:
           RUSTFLAGS: "--cfg loom"
 
